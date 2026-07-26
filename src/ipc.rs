@@ -1,9 +1,10 @@
-//! Dialogue avec Hyprland par ses deux sockets UNIX, sans passer par `hyprctl`.
+//! Talks to Hyprland over its two UNIX sockets, without going through
+//! `hyprctl`.
 //!
-//! * `.socket.sock`  — requêtes/commandes. Une connexion par commande : on
-//!   écrit la commande, on lit la réponse jusqu'à EOF.
-//! * `.socket2.sock` — flux d'événements. Connexion longue durée, lignes de la
-//!   forme `EVENEMENT>>DONNEES\n`.
+//! * `.socket.sock`  — requests/commands. One connection per command: write
+//!   the command, read the response until EOF.
+//! * `.socket2.sock` — event stream. Long-lived connection, lines shaped like
+//!   `EVENT>>DATA\n`.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -11,20 +12,21 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use rust_i18n::t;
 
 use crate::monitor::Monitor;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Abstraction du transport vers Hyprland.
+/// Abstraction over the transport to Hyprland.
 ///
-/// Tout le reste du programme ne dépend que de ce trait, ce qui permet de
-/// tester la logique métier sans compositeur en fonctionnement.
+/// The rest of the program only depends on this trait, which lets us test
+/// the business logic without a running compositor.
 pub trait HyprBackend: Send + Sync {
-    /// Envoie une commande brute et retourne la réponse textuelle.
+    /// Sends a raw command and returns the textual response.
     fn query(&self, cmd: &str) -> Result<String>;
 
-    /// Applique plusieurs commandes en une seule transaction Hyprland.
+    /// Applies several commands in a single Hyprland transaction.
     fn batch(&self, cmds: &[String]) -> Result<String> {
         if cmds.is_empty() {
             return Ok(String::new());
@@ -32,15 +34,15 @@ pub trait HyprBackend: Send + Sync {
         self.query(&format!("[[BATCH]]{}", cmds.join(";")))
     }
 
-    /// État de tous les écrans, y compris ceux qui sont désactivés.
+    /// State of all outputs, including the disabled ones.
     fn monitors(&self) -> Result<Vec<Monitor>> {
         let raw = self.query("j/monitors all")?;
         serde_json::from_str(&raw)
-            .with_context(|| format!("réponse JSON inattendue de Hyprland : {}", truncate(&raw)))
+            .with_context(|| t!("ipc.unexpected_response", body = truncate(&raw)).to_string())
     }
 
-    /// Applique une série de directives `monitor = …` et vérifie qu'aucune n'a
-    /// été rejetée.
+    /// Applies a series of `monitor = …` directives and checks that none of
+    /// them were rejected.
     fn set_monitors(&self, specs: &[String]) -> Result<()> {
         let cmds: Vec<String> = specs
             .iter()
@@ -51,22 +53,25 @@ pub trait HyprBackend: Send + Sync {
     }
 }
 
-/// Hyprland répond `ok` par commande acceptée ; tout le reste est un message
-/// d'erreur qu'il faut remonter tel quel à l'utilisateur.
+/// Hyprland replies `ok` for every accepted command; anything else is an
+/// error message that must be surfaced to the user as-is.
 fn check_ok(reply: &str, cmds: &[String]) -> Result<()> {
     let trimmed = reply.trim();
     if trimmed.is_empty() || trimmed.chars().all(|c| c.is_whitespace()) {
         return Ok(());
     }
-    // La réponse d'un batch est la concaténation des « ok ».
+    // A batch's response is the concatenation of "ok"s.
     let leftovers = trimmed.replace("ok", "");
     if leftovers.trim().is_empty() {
         return Ok(());
     }
     bail!(
-        "Hyprland a rejeté la configuration : {}\ncommandes envoyées :\n  {}",
-        trimmed,
-        cmds.join("\n  ")
+        t!(
+            "ipc.rejected",
+            message = trimmed,
+            commands = cmds.join("\n  ")
+        )
+        .to_string()
     );
 }
 
@@ -79,7 +84,7 @@ fn truncate(s: &str) -> String {
     }
 }
 
-/// Localise le répertoire de l'instance Hyprland courante.
+/// Locates the current Hyprland instance directory.
 pub fn instance_dir() -> Result<PathBuf> {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -92,20 +97,19 @@ pub fn instance_dir() -> Result<PathBuf> {
             return Ok(dir);
         }
         bail!(
-            "HYPRLAND_INSTANCE_SIGNATURE vaut « {sig} » mais {} n'existe pas",
-            dir.display()
+            t!(
+                "ipc.stale_signature",
+                signature = sig,
+                path = dir.display().to_string()
+            )
+            .to_string()
         );
     }
 
-    // Hors session Hyprland (systemd --user par exemple) : s'il n'y a qu'une
-    // seule instance, on la prend.
+    // Outside a Hyprland session (systemd --user, for instance): if there is
+    // only one instance, use it.
     let mut instances: Vec<PathBuf> = std::fs::read_dir(&base)
-        .with_context(|| {
-            format!(
-                "Hyprland ne semble pas tourner : {} introuvable",
-                base.display()
-            )
-        })?
+        .with_context(|| t!("ipc.not_running", path = base.display().to_string()).to_string())?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.join(".socket.sock").exists())
@@ -113,16 +117,20 @@ pub fn instance_dir() -> Result<PathBuf> {
     instances.sort();
 
     match instances.len() {
-        0 => bail!("aucune instance Hyprland trouvée dans {}", base.display()),
+        0 => bail!(t!("ipc.no_instance", path = base.display().to_string()).to_string()),
         1 => Ok(instances.remove(0)),
         n => bail!(
-            "{n} instances Hyprland trouvées dans {} — définissez HYPRLAND_INSTANCE_SIGNATURE",
-            base.display()
+            t!(
+                "ipc.many_instances",
+                count = n,
+                path = base.display().to_string()
+            )
+            .to_string()
         ),
     }
 }
 
-// Évite une dépendance à la crate `libc` pour un unique appel.
+// Avoids depending on the `libc` crate for a single call.
 unsafe fn libc_getuid() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
@@ -130,7 +138,7 @@ unsafe fn libc_getuid() -> u32 {
     unsafe { getuid() }
 }
 
-/// Transport réel : les sockets UNIX de Hyprland.
+/// Real transport: Hyprland's UNIX sockets.
 #[derive(Debug, Clone)]
 pub struct HyprSocket {
     dir: PathBuf,
@@ -159,42 +167,43 @@ impl HyprSocket {
 impl HyprBackend for HyprSocket {
     fn query(&self, cmd: &str) -> Result<String> {
         let path = self.request_socket();
-        let mut stream = UnixStream::connect(&path)
-            .with_context(|| format!("connexion à {} impossible", path.display()))?;
+        let mut stream =
+            UnixStream::connect(&path).with_context(|| t!("ipc.unreachable").to_string())?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         stream
             .write_all(cmd.as_bytes())
-            .with_context(|| format!("envoi de « {cmd} » impossible"))?;
+            .with_context(|| t!("ipc.send_failed", cmd = cmd).to_string())?;
         stream.flush()?;
 
         let mut buf = Vec::new();
         stream
             .read_to_end(&mut buf)
-            .with_context(|| format!("lecture de la réponse à « {cmd} » impossible"))?;
-        String::from_utf8(buf).map_err(|e| anyhow!("réponse non-UTF8 de Hyprland : {e}"))
+            .with_context(|| t!("ipc.read_failed", cmd = cmd).to_string())?;
+        String::from_utf8(buf)
+            .map_err(|e| anyhow!(t!("ipc.invalid_utf8", error = e.to_string()).to_string()))
     }
 }
 
-/// Événements du socket 2 qui nous concernent.
+/// Events from socket 2 that we care about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HyprEvent {
-    /// Un écran est apparu (nom du connecteur).
+    /// An output appeared (connector name).
     MonitorAdded(String),
-    /// Un écran a disparu (nom du connecteur).
+    /// An output disappeared (connector name).
     MonitorRemoved(String),
-    /// La configuration a été rechargée : l'état a pu changer sous nos pieds.
+    /// The configuration was reloaded: the state may have changed under us.
     ConfigReloaded,
-    /// Tout le reste, conservé pour le journal en mode verbeux.
+    /// Everything else, kept for verbose logging.
     Other(String),
 }
 
 impl HyprEvent {
-    /// Analyse une ligne `EVENEMENT>>DONNEES`.
+    /// Parses a line shaped like `EVENT>>DATA`.
     pub fn parse(line: &str) -> Option<Self> {
         let (event, data) = line.split_once(">>")?;
         Some(match event {
-            // `monitoraddedv2` porte « ID,NOM,DESCRIPTION » ; on ne garde que le nom.
+            // `monitoraddedv2` carries "ID,NAME,DESCRIPTION"; we only keep the name.
             "monitoraddedv2" => {
                 let mut parts = data.splitn(3, ',');
                 let _id = parts.next();
@@ -203,7 +212,7 @@ impl HyprEvent {
             }
             "monitoradded" => HyprEvent::MonitorAdded(data.to_string()),
             "monitorremoved" | "monitorremovedv2" => {
-                // La variante v2 porte « ID,NOM,DESCRIPTION ».
+                // The v2 variant carries "ID,NAME,DESCRIPTION".
                 let name = if event.ends_with("v2") {
                     data.split(',').nth(1).unwrap_or_default().to_string()
                 } else {
@@ -216,7 +225,7 @@ impl HyprEvent {
         })
     }
 
-    /// Un événement qui doit déclencher une réévaluation du profil.
+    /// An event that should trigger a profile re-evaluation.
     pub fn affects_monitors(&self) -> bool {
         matches!(
             self,
@@ -225,10 +234,10 @@ impl HyprEvent {
     }
 }
 
-/// Ouvre le flux d'événements et invoque `on_event` pour chaque ligne.
+/// Opens the event stream and invokes `on_event` for every line.
 ///
-/// La fonction ne rend la main que si le socket se ferme (Hyprland qui
-/// redémarre) ou si `on_event` retourne une erreur.
+/// The function only returns once the socket closes (Hyprland restarting) or
+/// `on_event` returns an error.
 pub async fn stream_events<F>(socket: &Path, mut on_event: F) -> Result<()>
 where
     F: FnMut(HyprEvent) -> Result<()>,
@@ -236,12 +245,9 @@ where
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixStream as AsyncUnixStream;
 
-    let stream = AsyncUnixStream::connect(socket).await.with_context(|| {
-        format!(
-            "connexion au flux d'événements {} impossible",
-            socket.display()
-        )
-    })?;
+    let stream = AsyncUnixStream::connect(socket)
+        .await
+        .with_context(|| t!("ipc.unreachable").to_string())?;
     let mut lines = BufReader::new(stream).lines();
     while let Some(line) = lines.next_line().await? {
         if let Some(event) = HyprEvent::parse(&line) {
@@ -253,7 +259,7 @@ where
 
 #[cfg(test)]
 pub mod fake {
-    //! Backend de test : rejoue des réponses figées et enregistre les commandes.
+    //! Test backend: replays canned responses and records the commands sent.
 
     use super::*;
     use std::sync::Mutex;
@@ -263,8 +269,9 @@ pub mod fake {
         pub monitors_json: Mutex<String>,
         pub sent: Mutex<Vec<String>>,
         pub fail_with: Mutex<Option<String>>,
-        /// Réponses successives à `j/monitors`, pour simuler un état qui met
-        /// quelques relectures à converger. La dernière reste servie ensuite.
+        /// Successive responses to `j/monitors`, to simulate a state that
+        /// takes a few reads to converge. The last one keeps being served
+        /// afterwards.
         pending_states: Mutex<Vec<String>>,
     }
 
@@ -276,8 +283,8 @@ pub mod fake {
             }
         }
 
-        /// Backend qui rend `stale` pendant `repeats` relectures avant de
-        /// rendre `settled` — reproduit la latence d'application de Hyprland.
+        /// Backend that returns `stale` for `repeats` reads before returning
+        /// `settled` — reproduces Hyprland's application latency.
         pub fn settling_after(repeats: usize, stale: &str, settled: &str) -> Self {
             let mut states = vec![stale.to_string(); repeats];
             states.reverse();
@@ -364,7 +371,7 @@ mod tests {
 
     #[test]
     fn malformed_lines_yield_nothing() {
-        assert_eq!(HyprEvent::parse("pas de séparateur"), None);
+        assert_eq!(HyprEvent::parse("no separator"), None);
     }
 
     #[test]

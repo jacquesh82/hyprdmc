@@ -1,14 +1,14 @@
-//! Démon : état partagé, réaction au branchement à chaud, retour arrière
-//! différé.
+//! Daemon: shared state, hotplug reaction, deferred revert.
 //!
-//! C'est le composant qui « maintient dynamiquement » la configuration : il
-//! écoute le flux d'événements de Hyprland et réapplique le profil qui
-//! correspond au matériel présent dès qu'il change.
+//! This is the component that "dynamically maintains" the configuration: it
+//! listens to Hyprland's event stream and reapplies the profile that
+//! matches the currently connected hardware whenever it changes.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rust_i18n::t;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -18,24 +18,24 @@ use crate::ipc::{HyprBackend, HyprEvent, HyprSocket};
 use crate::layout::Layout;
 use crate::monitor::Monitor;
 
-/// Un dock émet plusieurs événements d'affilée ; on attend que ça se calme.
+/// A dock fires several events in a row; we wait for things to settle.
 const DEBOUNCE: Duration = Duration::from_millis(500);
-/// Reconnexion au flux d'événements : premier délai, puis doublement.
+/// Reconnecting to the event stream: initial delay, then doubles.
 const RECONNECT_MIN: Duration = Duration::from_millis(250);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// Retour arrière programmé, en attente de confirmation.
+/// Scheduled revert, waiting for confirmation.
 struct PendingRevert {
-    /// Dernier état confirmé, vers lequel revenir.
+    /// Last confirmed state, to revert to.
     previous: Layout,
     timer: JoinHandle<()>,
 }
 
-/// État partagé entre le démon, l'API web et les commandes ponctuelles.
+/// State shared between the daemon, the web API, and one-off commands.
 pub struct AppState {
     pub backend: Arc<dyn HyprBackend>,
     pub config: RwLock<Config>,
-    /// Diffusion de l'état complet vers les clients SSE.
+    /// Broadcasts the full state to SSE clients.
     pub events: broadcast::Sender<String>,
     pending: Mutex<Option<PendingRevert>>,
 }
@@ -51,14 +51,14 @@ impl AppState {
         })
     }
 
-    /// Lit l'état des écrans sans bloquer l'exécuteur asynchrone.
+    /// Reads output state without blocking the async executor.
     pub async fn monitors(&self) -> Result<Vec<Monitor>> {
         let backend = Arc::clone(&self.backend);
         tokio::task::spawn_blocking(move || backend.monitors()).await?
     }
 
-    /// Applique un agencement, puis arme le retour arrière automatique si
-    /// l'utilisateur a laissé le filet de sécurité actif.
+    /// Applies a layout, then arms the automatic revert if the user has
+    /// left the safety net active.
     pub async fn apply(
         self: &Arc<Self>,
         layout: Layout,
@@ -80,7 +80,7 @@ impl AppState {
         if guard && report.succeeded() && !timeout.is_zero() {
             self.arm_revert(previous, timeout).await;
         } else if report.succeeded() {
-            // Application ferme : l'état courant devient la nouvelle référence.
+            // A firm apply: the current state becomes the new reference.
             self.cancel_revert().await;
         }
 
@@ -88,9 +88,9 @@ impl AppState {
         Ok(report)
     }
 
-    /// Programme le retour arrière. Si un retour était déjà armé, on conserve
-    /// **son** état de référence : c'est le dernier état confirmé par
-    /// l'utilisateur, pas un état intermédiaire jamais validé.
+    /// Schedules the revert. If a revert was already armed, we keep **its**
+    /// reference state: the last one confirmed by the user, not some
+    /// intermediate state that was never validated.
     async fn arm_revert(self: &Arc<Self>, previous: Layout, timeout: Duration) {
         let mut slot = self.pending.lock().await;
         let previous = match slot.take() {
@@ -105,7 +105,7 @@ impl AppState {
         let to_restore = previous.clone();
         let timer = tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            tracing::warn!("aucune confirmation reçue : retour à la configuration précédente");
+            tracing::warn!("no confirmation received: reverting to the previous configuration");
             let backend = Arc::clone(&state.backend);
             let layout = to_restore.clone();
             let _ = tokio::task::spawn_blocking(move || apply::restore(backend.as_ref(), &layout))
@@ -117,7 +117,7 @@ impl AppState {
         *slot = Some(PendingRevert { previous, timer });
     }
 
-    /// Confirme la configuration courante : le retour arrière est désarmé.
+    /// Confirms the current configuration: the revert is disarmed.
     pub async fn confirm(&self) -> bool {
         self.cancel_revert().await
     }
@@ -132,12 +132,12 @@ impl AppState {
         }
     }
 
-    /// Un retour arrière est-il en attente de confirmation ?
+    /// Is a revert pending confirmation?
     pub async fn revert_pending(&self) -> bool {
         self.pending.lock().await.is_some()
     }
 
-    /// Revient immédiatement au dernier état confirmé.
+    /// Reverts immediately to the last confirmed state.
     pub async fn revert_now(&self) -> Result<bool> {
         let Some(p) = self.pending.lock().await.take() else {
             return Ok(false);
@@ -150,10 +150,10 @@ impl AppState {
         Ok(true)
     }
 
-    /// Choisit et applique le profil correspondant au matériel branché.
+    /// Picks and applies the profile matching the connected hardware.
     ///
-    /// Sans profil correspondant, on se contente d'un rangement horizontal :
-    /// mieux vaut des écrans côte à côte qu'un écran empilé sur un autre.
+    /// Without a matching profile, we fall back to a simple horizontal
+    /// arrangement: outputs side by side beat one stacked on top of another.
     pub async fn reconcile(self: &Arc<Self>) -> Result<Option<String>> {
         let monitors = self.monitors().await?;
         let (name, layout) = {
@@ -163,7 +163,7 @@ impl AppState {
                 None => {
                     let mut layout = Layout::from_monitors(&monitors);
                     if layout.has_errors() {
-                        tracing::info!("aucun profil ne correspond : rangement automatique");
+                        tracing::info!("no profile matches: arranging automatically");
                         layout.auto_arrange();
                     }
                     (None, layout)
@@ -172,16 +172,16 @@ impl AppState {
         };
 
         match &name {
-            Some(n) => tracing::info!("application du profil « {n} »"),
-            None => tracing::debug!("aucun profil correspondant"),
+            Some(n) => tracing::info!("applying profile \"{n}\""),
+            None => tracing::debug!("no matching profile"),
         }
 
-        // Application ferme : personne n'est là pour confirmer un branchement.
+        // A firm apply: nobody is around to confirm a hotplug event.
         self.apply(layout, false, false).await?;
         Ok(name)
     }
 
-    /// Instantané complet destiné à l'API et au flux SSE.
+    /// Full snapshot for the API and the SSE stream.
     pub async fn state_json(&self) -> Result<serde_json::Value> {
         let monitors = self.monitors().await?;
         let layout = Layout::from_monitors(&monitors);
@@ -197,7 +197,7 @@ impl AppState {
         }))
     }
 
-    /// Pousse l'état courant vers les clients connectés.
+    /// Pushes the current state to connected clients.
     pub async fn broadcast(&self) {
         if self.events.receiver_count() == 0 {
             return;
@@ -206,21 +206,21 @@ impl AppState {
             Ok(value) => {
                 let _ = self.events.send(value.to_string());
             }
-            Err(err) => tracing::warn!("état non diffusable : {err:#}"),
+            Err(err) => tracing::warn!("could not broadcast state: {err:#}"),
         }
     }
 }
 
-/// Boucle principale du démon.
+/// Main daemon loop.
 ///
-/// `socket` est le chemin de `.socket2.sock`. La fonction ne rend la main que
-/// sur erreur fatale ou signal d'arrêt.
+/// `socket` is the path to `.socket2.sock`. The function only returns on a
+/// fatal error or a shutdown signal.
 pub async fn run(state: Arc<AppState>, hypr: &HyprSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<HyprEvent>();
     let socket = hypr.event_socket();
 
-    // Le flux d'événements vit dans sa propre tâche et se reconnecte tout seul :
-    // Hyprland peut redémarrer sans emporter le démon.
+    // The event stream lives in its own task and reconnects on its own:
+    // Hyprland can restart without taking the daemon down with it.
     let listener = tokio::spawn(async move {
         let mut backoff = RECONNECT_MIN;
         loop {
@@ -231,20 +231,20 @@ pub async fn run(state: Arc<AppState>, hypr: &HyprSocket) -> Result<()> {
             })
             .await
             {
-                Ok(()) => tracing::warn!("flux d'événements fermé par Hyprland"),
-                Err(err) => tracing::warn!("flux d'événements indisponible : {err:#}"),
+                Ok(()) => tracing::warn!("event stream closed by Hyprland"),
+                Err(err) => tracing::warn!("event stream unavailable: {err:#}"),
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(RECONNECT_MAX);
         }
     });
 
-    // Premier alignement au démarrage : le matériel a pu changer pendant que le
-    // démon ne tournait pas.
+    // Initial alignment on startup: the hardware may have changed while the
+    // daemon was not running.
     if state.config.read().await.settings.auto_apply
         && let Err(err) = state.reconcile().await
     {
-        tracing::error!("alignement initial impossible : {err:#}");
+        tracing::error!("initial alignment failed: {err:#}");
     }
 
     let mut deadline: Option<tokio::time::Instant> = None;
@@ -260,7 +260,7 @@ pub async fn run(state: Arc<AppState>, hypr: &HyprSocket) -> Result<()> {
             event = rx.recv() => match event {
                 Some(ev) => {
                     if ev.affects_monitors() {
-                        tracing::debug!("événement écran : {ev:?}");
+                        tracing::debug!("output event: {ev:?}");
                         deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                     }
                 }
@@ -270,14 +270,14 @@ pub async fn run(state: Arc<AppState>, hypr: &HyprSocket) -> Result<()> {
                 deadline = None;
                 if state.config.read().await.settings.auto_apply {
                     if let Err(err) = state.reconcile().await {
-                        tracing::error!("réaction au branchement impossible : {err:#}");
+                        tracing::error!("could not react to hotplug: {err:#}");
                     }
                 } else {
                     state.broadcast().await;
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("arrêt demandé");
+                tracing::info!("shutdown requested");
                 break;
             }
         }
@@ -287,9 +287,9 @@ pub async fn run(state: Arc<AppState>, hypr: &HyprSocket) -> Result<()> {
     Ok(())
 }
 
-/// Construit l'état partagé à partir de la configuration sur disque.
+/// Builds the shared state from the configuration on disk.
 pub fn bootstrap() -> Result<(Arc<AppState>, HyprSocket)> {
-    let hypr = HyprSocket::connect().context("Hyprland introuvable")?;
+    let hypr = HyprSocket::connect().context(t!("ipc.unreachable").to_string())?;
     let config = Config::load()?;
     let state = AppState::new(Arc::new(hypr.clone()), config);
     Ok((state, hypr))
@@ -339,7 +339,7 @@ mod tests {
         let cfg: Config = toml::from_str(
             r#"
             [[profile]]
-            name = "bureau"
+            name = "desk"
             [[profile.output]]
             match = "eDP-1"
             position = "0x0"
@@ -350,7 +350,7 @@ mod tests {
         )
         .unwrap();
         let state = state_with(&json_two_screens(), cfg);
-        assert_eq!(state.reconcile().await.unwrap().as_deref(), Some("bureau"));
+        assert_eq!(state.reconcile().await.unwrap().as_deref(), Some("desk"));
     }
 
     #[tokio::test]
@@ -388,7 +388,7 @@ mod tests {
         state.apply(original.clone(), false, true).await.unwrap();
         state.apply(original.clone(), false, true).await.unwrap();
 
-        // Le point de retour reste le premier, jamais un état intermédiaire.
+        // The revert point stays the first one, never an intermediate state.
         let pending = state.pending.lock().await;
         assert_eq!(pending.as_ref().unwrap().previous, original);
     }
@@ -403,7 +403,7 @@ mod tests {
 
         assert!(state.revert_now().await.unwrap());
         assert!(!state.revert_pending().await);
-        // Rien en attente : un second appel ne fait rien.
+        // Nothing pending: a second call does nothing.
         assert!(!state.revert_now().await.unwrap());
     }
 
@@ -419,7 +419,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(
             !state.revert_pending().await,
-            "le retour arrière doit s'être déclenché tout seul"
+            "the revert should have triggered on its own"
         );
     }
 }

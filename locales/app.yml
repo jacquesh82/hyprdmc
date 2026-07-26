@@ -1,0 +1,452 @@
+_version: 2
+
+# Every user-facing string of hyprdmc.
+#
+# Keys are grouped by the module that emits them. Placeholders use the
+# `%{name}` syntax of rust-i18n and must appear in every translation.
+#
+# Adding a language: add its code to `AVAILABLE` in `src/i18n.rs`, then a line
+# under each key here. Missing keys fall back to English.
+
+# ---------------------------------------------------------------- monitors --
+monitor.rotation:
+  en: "%{degrees}°"
+  fr: "%{degrees}°"
+monitor.orientation.flipped:
+  en: "%{rotation} flipped"
+  fr: "%{rotation} inversé"
+monitor.invalid_rotation:
+  en: "invalid rotation: %{degrees}° (expected 0, 90, 180 or 270)"
+  fr: "rotation invalide : %{degrees}° (attendu 0, 90, 180 ou 270)"
+monitor.invalid_transform:
+  en: "invalid transform: %{value} (expected 0..=7)"
+  fr: "transform invalide : %{value} (attendu 0..=7)"
+monitor.invalid_mode:
+  en: "invalid mode “%{value}” (expected WIDTHxHEIGHT[@RATE])"
+  fr: "mode invalide « %{value} » (attendu LARGEURxHAUTEUR[@TAUX])"
+monitor.invalid_refresh:
+  en: "invalid refresh rate in “%{value}”"
+  fr: "taux de rafraîchissement invalide dans « %{value} »"
+monitor.invalid_width:
+  en: "invalid width in “%{value}”"
+  fr: "largeur invalide dans « %{value} »"
+monitor.invalid_height:
+  en: "invalid height in “%{value}”"
+  fr: "hauteur invalide dans « %{value} »"
+
+# ------------------------------------------------------------------ layout --
+layout.severity.error:
+  en: "error"
+  fr: "erreur"
+layout.severity.warning:
+  en: "warning"
+  fr: "attention"
+layout.issue.duplicate_output:
+  en: "output “%{name}” is defined %{count} times"
+  fr: "l'écran « %{name} » est défini %{count} fois"
+layout.issue.invalid_scale:
+  en: "invalid scale for “%{name}”: %{scale}"
+  fr: "échelle invalide pour « %{name} » : %{scale}"
+layout.issue.non_integral_scale:
+  en: "scale %{scale} yields a non-integral logical size (%{width}x%{height}) on “%{name}”: Hyprland will round it (near %{suggestion})"
+  fr: "l'échelle %{scale} donne une taille logique non entière (%{width}x%{height}) pour « %{name} » : Hyprland l'ajustera (autour de %{suggestion})"
+layout.issue.mirror_missing:
+  en: "“%{name}” mirrors “%{target}”, which does not exist"
+  fr: "« %{name} » duplique « %{target} », qui n'existe pas"
+layout.issue.mirror_disabled:
+  en: "“%{name}” mirrors “%{target}”, which is disabled"
+  fr: "« %{name} » duplique « %{target} », qui est désactivé"
+layout.issue.overlap:
+  en: "“%{a}” and “%{b}” overlap"
+  fr: "« %{a} » et « %{b} » se chevauchent"
+layout.issue.unreachable:
+  en: "“%{name}” touches no other output: the cursor will not be able to reach it"
+  fr: "« %{name} » ne touche aucun autre écran : le curseur ne pourra pas y accéder"
+layout.issue.all_disabled:
+  en: "every output would be disabled"
+  fr: "tous les écrans seraient désactivés"
+layout.unknown_anchor:
+  en: "unknown reference output “%{name}”"
+  fr: "écran de référence « %{name} » inconnu"
+layout.unknown_output:
+  en: "unknown output “%{name}”"
+  fr: "écran « %{name} » inconnu"
+layout.self_reference:
+  en: "“%{name}” cannot be positioned relative to itself"
+  fr: "« %{name} » ne peut pas être positionné par rapport à lui-même"
+layout.unknown_relation:
+  en: "unknown relation “%{value}” (expected left-of, right-of, above, below, same-as)"
+  fr: "relation inconnue « %{value} » (attendu left-of, right-of, above, below, same-as)"
+
+# ------------------------------------------------------------------- apply --
+apply.drift.vanished:
+  en: "“%{name}” disappeared from the output list"
+  fr: "« %{name} » a disparu de la liste des écrans"
+apply.drift.enabled_mismatch:
+  en: "“%{name}” should be %{wanted} but is %{got}"
+  fr: "« %{name} » devrait être %{wanted} mais est %{got}"
+apply.state.enabled:
+  en: "enabled"
+  fr: "activé"
+apply.state.disabled:
+  en: "disabled"
+  fr: "désactivé"
+apply.drift.mode_refused:
+  en: "mode refused on “%{name}”: asked %{wanted}, got %{got}"
+  fr: "mode refusé pour « %{name} » : %{wanted} demandé, %{got} obtenu"
+apply.drift.refresh_adjusted:
+  en: "refresh rate adjusted on “%{name}”: asked %{wanted} Hz, got %{got} Hz"
+  fr: "taux de rafraîchissement ajusté sur « %{name} » : %{wanted} Hz demandé, %{got} Hz obtenu"
+apply.drift.position_refused:
+  en: "position refused on “%{name}”: asked %{wanted}, got %{got}"
+  fr: "position refusée pour « %{name} » : %{wanted} demandé, %{got} obtenu"
+apply.drift.transform_refused:
+  en: "orientation refused on “%{name}”: asked %{wanted}, got %{got}"
+  fr: "orientation refusée pour « %{name} » : %{wanted} demandé, %{got} obtenu"
+apply.drift.scale_adjusted:
+  en: "scale adjusted by Hyprland on “%{name}”: asked %{wanted}, applied %{got}"
+  fr: "échelle ajustée par Hyprland sur « %{name} » : %{wanted} demandé, %{got} appliqué"
+apply.drift.mirror_mismatch:
+  en: "mirroring mismatch on “%{name}”: asked %{wanted}, got %{got}"
+  fr: "duplication non conforme sur « %{name} » : %{wanted} demandé, %{got} obtenu"
+apply.mirror.none:
+  en: "none"
+  fr: "aucune"
+apply.rejected:
+  en: "layout rejected:\n%{issues}\n(use --force to apply anyway)"
+  fr: "agencement refusé :\n%{issues}\n(utilisez --force pour passer outre)"
+apply.confirm_prompt:
+  en: "Keep this configuration? [y/N] (automatic revert in %{seconds}s) "
+  fr: "Conserver cette configuration ? [o/N] (retour arrière automatique dans %{seconds} s) "
+apply.reverted:
+  en: "Reverted to the previous configuration."
+  fr: "Retour à la configuration précédente."
+apply.not_applied:
+  en: "configuration not applied: the previous state has been restored"
+  fr: "configuration non appliquée : l'état précédent a été restauré"
+
+# --------------------------------------------------------------------- ipc --
+ipc.rejected:
+  en: "Hyprland rejected the configuration: %{message}\ncommands sent:\n  %{commands}"
+  fr: "Hyprland a rejeté la configuration : %{message}\ncommandes envoyées :\n  %{commands}"
+ipc.unreachable:
+  en: "Hyprland does not seem to be reachable"
+  fr: "Hyprland ne semble pas accessible"
+ipc.not_running:
+  en: "Hyprland does not seem to be running: %{path} not found"
+  fr: "Hyprland ne semble pas tourner : %{path} introuvable"
+ipc.no_instance:
+  en: "no Hyprland instance found in %{path}"
+  fr: "aucune instance Hyprland trouvée dans %{path}"
+ipc.many_instances:
+  en: "%{count} Hyprland instances found in %{path} — set HYPRLAND_INSTANCE_SIGNATURE"
+  fr: "%{count} instances Hyprland trouvées dans %{path} — définissez HYPRLAND_INSTANCE_SIGNATURE"
+ipc.stale_signature:
+  en: "HYPRLAND_INSTANCE_SIGNATURE is “%{signature}” but %{path} does not exist"
+  fr: "HYPRLAND_INSTANCE_SIGNATURE vaut « %{signature} » mais %{path} n'existe pas"
+
+ipc.unexpected_response:
+  en: "unexpected JSON response from Hyprland: %{body}"
+  fr: "réponse JSON inattendue de Hyprland : %{body}"
+ipc.send_failed:
+  en: "could not send “%{cmd}”"
+  fr: "envoi de « %{cmd} » impossible"
+ipc.read_failed:
+  en: "could not read the response to “%{cmd}”"
+  fr: "lecture de la réponse à « %{cmd} » impossible"
+ipc.invalid_utf8:
+  en: "non-UTF8 response from Hyprland: %{error}"
+  fr: "réponse non-UTF8 de Hyprland : %{error}"
+
+# ----------------------------------------------------------------- files ----
+fs.create_dir_failed:
+  en: "could not create %{path}"
+  fr: "création de %{path} impossible"
+fs.read_failed:
+  en: "could not read %{path}"
+  fr: "lecture de %{path} impossible"
+fs.write_failed:
+  en: "could not write to %{path}"
+  fr: "écriture dans %{path} impossible"
+fs.rename_failed:
+  en: "could not replace %{path}"
+  fr: "remplacement de %{path} impossible"
+fs.backup_failed:
+  en: "could not back up to %{path}"
+  fr: "sauvegarde vers %{path} impossible"
+
+# ------------------------------------------------------------------ emit ----
+emit.header:
+  en: |
+    # Generated by hyprdmc — DO NOT EDIT BY HAND.
+    # Rewritten on every `hyprdmc persist` or profile application.
+    # To change the layout: `hyprdmc set`, `hyprdmc arrange`, or the web interface.
+  fr: |
+    # Généré par hyprdmc — NE PAS ÉDITER À LA MAIN.
+    # Réécrit à chaque `hyprdmc persist` ou application de profil.
+    # Pour modifier l'agencement : `hyprdmc set`, `hyprdmc arrange`, ou l'interface web.
+emit.adopted_comment:
+  en: "# adopted by hyprdmc -> %{target}"
+  fr: "# repris par hyprdmc -> %{target}"
+
+# ------------------------------------------------------------------ config --
+config.malformed:
+  en: "%{path} is malformed"
+  fr: "%{path} est mal formé"
+config.unknown_profile:
+  en: "unknown profile “%{name}”"
+  fr: "profil « %{name} » inconnu"
+config.profile_mismatch:
+  en: "profile “%{name}” does not match the connected outputs"
+  fr: "le profil « %{name} » ne correspond pas aux écrans branchés"
+config.invalid_position:
+  en: "invalid position “%{value}” (expected XxY, for example 1920x0)"
+  fr: "position invalide « %{value} » (attendu XxY, par exemple 1920x0)"
+config.invalid_x:
+  en: "invalid x coordinate in “%{value}”"
+  fr: "abscisse invalide dans « %{value} »"
+config.invalid_y:
+  en: "invalid y coordinate in “%{value}”"
+  fr: "ordonnée invalide dans « %{value} »"
+
+# -------------------------------------------------------------------- cli ---
+cli.table.output:
+  en: "Output"
+  fr: "Écran"
+cli.table.state:
+  en: "State"
+  fr: "État"
+cli.table.mode:
+  en: "Mode"
+  fr: "Mode"
+cli.table.position:
+  en: "Position"
+  fr: "Position"
+cli.table.scale:
+  en: "Scale"
+  fr: "Échelle"
+cli.table.orientation:
+  en: "Orientation"
+  fr: "Orientation"
+cli.table.identifier:
+  en: "Identifier"
+  fr: "Identifiant"
+cli.table.profile:
+  en: "Profile"
+  fr: "Profil"
+cli.table.outputs:
+  en: "Outputs"
+  fr: "Écrans"
+cli.table.exact:
+  en: "Exact"
+  fr: "Exact"
+cli.table.matches:
+  en: "Matches"
+  fr: "Correspond"
+cli.state.disabled:
+  en: "disabled"
+  fr: "désactivé"
+cli.state.active:
+  en: "active"
+  fr: "actif"
+cli.state.focused:
+  en: "active (focused)"
+  fr: "actif (focus)"
+cli.state.mirror:
+  en: "mirrors %{target}"
+  fr: "miroir de %{target}"
+cli.yes:
+  en: "yes"
+  fr: "oui"
+cli.no:
+  en: "no"
+  fr: "non"
+cli.current:
+  en: "current"
+  fr: "actuel"
+cli.active_marker:
+  en: "← active"
+  fr: "← actif"
+cli.no_outputs:
+  en: "No output detected."
+  fr: "Aucun écran détecté."
+cli.no_modes:
+  en: "No mode reported for “%{name}”."
+  fr: "Aucun mode rapporté pour « %{name} »."
+cli.unknown_output:
+  en: "output “%{name}” not found (known: %{known})"
+  fr: "écran « %{name} » introuvable (connus : %{known})"
+cli.arrange_expects_triples:
+  en: "arrange expects “OUTPUT RELATION REFERENCE” triples (%{count} argument(s) given)"
+  fr: "arrange attend des triplets « ÉCRAN RELATION RÉFÉRENCE » (%{count} argument(s) reçu(s))"
+cli.invalid_onoff:
+  en: "expected on or off (got “%{value}”)"
+  fr: "valeur attendue : on ou off (reçu « %{value} »)"
+cli.invalid_bind:
+  en: "invalid listen address"
+  fr: "adresse d'écoute invalide"
+cli.profile_saved:
+  en: "Profile “%{name}” saved."
+  fr: "Profil « %{name} » enregistré."
+cli.profile_saved_in:
+  en: "Profile “%{name}” saved to %{path}."
+  fr: "Profil « %{name} » enregistré dans %{path}."
+cli.profile_deleted:
+  en: "Profile “%{name}” deleted."
+  fr: "Profil « %{name} » supprimé."
+cli.profile_renamed:
+  en: "Profile “%{from}” renamed to “%{to}”."
+  fr: "Profil « %{from} » renommé en « %{to} »."
+cli.no_profiles:
+  en: "No profile yet. Create one with “hyprdmc profile save <name>”.\nFile: %{path}"
+  fr: "Aucun profil. Créez-en un avec « hyprdmc profile save <nom> ».\nFichier : %{path}"
+cli.matching_profile:
+  en: "Matching profile: “%{name}”."
+  fr: "Profil correspondant : « %{name} »."
+cli.no_matching_profile:
+  en: "No profile matches: falling back to automatic arrangement."
+  fr: "Aucun profil ne correspond : rangement automatique."
+cli.persisted:
+  en: "Layout written to %{path}."
+  fr: "Agencement écrit dans %{path}."
+cli.not_sourced:
+  en: "Warning: %{path} does not source that file yet. Run “hyprdmc init”."
+  fr: "Attention : %{path} ne source pas encore ce fichier. Lancez « hyprdmc init »."
+cli.init.already_wired:
+  en: "%{conf} already sources %{target}. Nothing to do."
+  fr: "%{conf} source déjà %{target}. Rien à faire."
+cli.init.dry_run_header:
+  en: "--- %{path} (dry run) ---"
+  fr: "--- %{path} (simulation) ---"
+cli.init.backup:
+  en: "Backup: %{path}"
+  fr: "Sauvegarde : %{path}"
+cli.init.source_added:
+  en: "Adding “source = %{path}”."
+  fr: "Ajout de « source = %{path} »."
+cli.init.adopted:
+  en: "%{count} monitor directive(s) adopted and commented out in hyprland.conf."
+  fr: "%{count} directive(s) monitor reprise(s) et commentée(s) dans hyprland.conf."
+cli.init.reload_hint:
+  en: "Reload with “hyprctl reload”."
+  fr: "Rechargez avec « hyprctl reload »."
+
+cli.web.listening:
+  en: "Web UI: %{url}"
+  fr: "Interface web : %{url}"
+cli.web.opening:
+  en: "Opening it in your browser…"
+  fr: "Ouverture dans votre navigateur…"
+cli.web.open_failed:
+  en: "Could not open a browser (%{error}) — open %{url} yourself."
+  fr: "Impossible d'ouvrir un navigateur (%{error}) — ouvrez %{url} vous-même."
+cli.init.current_persisted:
+  en: "Current layout written to %{path}."
+  fr: "Agencement courant écrit dans %{path}."
+
+# -------------------------------------------------------------------- web ---
+web.title:
+  en: "hyprdmc — displays"
+  fr: "hyprdmc — écrans"
+web.profile_badge:
+  en: "profile: %{name}"
+  fr: "profil : %{name}"
+web.connection:
+  en: "connection to the daemon"
+  fr: "connexion au démon"
+web.canvas_label:
+  en: "Display arrangement"
+  fr: "Disposition des écrans"
+web.hint:
+  en: "Drag an output to move it — it snaps to neighbouring edges. Arrow keys for fine adjustment."
+  fr: "Glissez un écran pour le déplacer — il s'aimante aux bords voisins. Flèches du clavier pour un réglage fin."
+web.select_prompt:
+  en: "Select an output to configure it."
+  fr: "Sélectionnez un écran pour le configurer."
+web.guard.applied:
+  en: "Configuration applied. Automatic revert in %{seconds}s."
+  fr: "Configuration appliquée. Retour arrière automatique dans %{seconds} s."
+web.guard.keep:
+  en: "Keep"
+  fr: "Conserver"
+web.guard.revert:
+  en: "Revert"
+  fr: "Revenir en arrière"
+web.action.apply:
+  en: "Apply"
+  fr: "Appliquer"
+web.action.reset:
+  en: "Discard changes"
+  fr: "Annuler les modifications"
+web.action.auto:
+  en: "Arrange automatically"
+  fr: "Ranger automatiquement"
+web.action.save:
+  en: "Save as profile…"
+  fr: "Enregistrer comme profil…"
+web.action.persist:
+  en: "Make permanent"
+  fr: "Rendre permanent"
+web.field.enabled:
+  en: "Output enabled"
+  fr: "Écran activé"
+web.field.mode:
+  en: "Mode"
+  fr: "Mode"
+web.field.scale:
+  en: "Scale"
+  fr: "Échelle"
+web.field.rotation:
+  en: "Rotation"
+  fr: "Rotation"
+web.field.flip:
+  en: "Flip the image"
+  fr: "Inverser l'image"
+web.field.mirror:
+  en: "Mirror"
+  fr: "Dupliquer"
+web.field.vrr:
+  en: "Variable refresh rate (VRR)"
+  fr: "Rafraîchissement variable (VRR)"
+web.mirror.none:
+  en: "none"
+  fr: "aucune"
+web.screen.disabled:
+  en: "disabled"
+  fr: "désactivé"
+web.screen.flipped:
+  en: "flipped"
+  fr: "inversé"
+web.prompt.profile_name:
+  en: "Profile name?"
+  fr: "Nom du profil ?"
+web.toast.applied:
+  en: "Configuration applied."
+  fr: "Configuration appliquée."
+web.toast.rolled_back:
+  en: "Hyprland did not apply the configuration: previous state restored."
+  fr: "Hyprland n'a pas appliqué la configuration : état précédent restauré."
+web.toast.kept:
+  en: "Configuration kept."
+  fr: "Configuration conservée."
+web.toast.reverted:
+  en: "Previous configuration restored."
+  fr: "Configuration précédente restaurée."
+web.toast.profile_saved:
+  en: "Profile “%{name}” saved."
+  fr: "Profil « %{name} » enregistré."
+web.toast.persisted:
+  en: "Layout written to %{path}."
+  fr: "Agencement écrit dans %{path}."
+web.issue.overlap:
+  en: "“%{a}” and “%{b}” overlap"
+  fr: "« %{a} » et « %{b} » se chevauchent"
+web.issue.all_disabled:
+  en: "every output would be disabled"
+  fr: "tous les écrans seraient désactivés"
+web.issue.mirror_unavailable:
+  en: "“%{name}” mirrors an unavailable output"
+  fr: "« %{name} » duplique un écran indisponible"
+web.not_found:
+  en: "not found"
+  fr: "introuvable"

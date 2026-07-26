@@ -1,13 +1,14 @@
-//! Modèle d'un écran tel que rapporté par Hyprland, plus les types de rotation
-//! et de mode qui gravitent autour.
+//! The model of a monitor as reported by Hyprland, plus the rotation and
+//! mode types that revolve around it.
 
 use std::fmt;
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow, bail};
+use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
-/// Rotation appliquée à un écran, en degrés dans le sens horaire.
+/// Rotation applied to a monitor, in clockwise degrees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Rotation {
     #[default]
@@ -33,11 +34,11 @@ impl Rotation {
             90 => Rotation::R90,
             180 => Rotation::R180,
             270 => Rotation::R270,
-            other => bail!("rotation invalide : {other}° (attendu 0, 90, 180 ou 270)"),
+            other => bail!(t!("monitor.invalid_rotation", degrees = other.to_string()).to_string()),
         })
     }
 
-    /// Vrai lorsque la rotation échange largeur et hauteur.
+    /// True when the rotation swaps width and height.
     pub fn swaps_axes(self) -> bool {
         matches!(self, Rotation::R90 | Rotation::R270)
     }
@@ -54,16 +55,20 @@ impl Rotation {
 
 impl fmt::Display for Rotation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}°", self.degrees())
+        write!(
+            f,
+            "{}",
+            t!("monitor.rotation", degrees = self.degrees().to_string())
+        )
     }
 }
 
-/// Rotation + inversement, encodés dans le `transform` unique de Hyprland.
+/// Rotation + flip, encoded into Hyprland's single `transform` value.
 ///
 /// | transform | 0 | 1  | 2   | 3   | 4 | 5  | 6   | 7   |
 /// |-----------|---|----|-----|-----|---|----|-----|-----|
 /// | rotation  | 0 | 90 | 180 | 270 | 0 | 90 | 180 | 270 |
-/// | inversé   | n | n  | n   | n   | o | o  | o   | o   |
+/// | flipped   | n | n  | n   | n   | y | y  | y   | y   |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Transform {
     pub rotation: Rotation,
@@ -81,7 +86,7 @@ impl Transform {
 
     pub fn from_u8(v: u8) -> Result<Self> {
         if v > 7 {
-            bail!("transform invalide : {v} (attendu 0..=7)");
+            bail!(t!("monitor.invalid_transform", value = v.to_string()).to_string());
         }
         let rotation = match v % 4 {
             0 => Rotation::R0,
@@ -103,14 +108,21 @@ impl Transform {
 impl fmt::Display for Transform {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.flipped {
-            write!(f, "{} inversé", self.rotation)
+            write!(
+                f,
+                "{}",
+                t!(
+                    "monitor.orientation.flipped",
+                    rotation = self.rotation.to_string()
+                )
+            )
         } else {
             write!(f, "{}", self.rotation)
         }
     }
 }
 
-/// Un mode d'affichage : résolution + taux de rafraîchissement.
+/// A display mode: resolution + refresh rate.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Mode {
     pub width: i32,
@@ -131,7 +143,7 @@ impl Mode {
 impl FromStr for Mode {
     type Err = anyhow::Error;
 
-    /// Accepte `1920x1080`, `1920x1080@60`, `1920x1080@60.06Hz`.
+    /// Accepts `1920x1080`, `1920x1080@60`, `1920x1080@60.06Hz`.
     fn from_str(s: &str) -> Result<Self> {
         let s = s.trim().trim_end_matches("Hz").trim_end_matches("hz");
         let (res, refresh) = match s.split_once('@') {
@@ -139,22 +151,22 @@ impl FromStr for Mode {
                 res,
                 rate.trim()
                     .parse::<f64>()
-                    .map_err(|_| anyhow!("taux de rafraîchissement invalide dans « {s} »"))?,
+                    .map_err(|_| anyhow!(t!("monitor.invalid_refresh", value = s).to_string()))?,
             ),
             None => (s, 0.0),
         };
         let (w, h) = res
             .split_once(['x', 'X'])
-            .ok_or_else(|| anyhow!("mode invalide « {s} » (attendu LARGEURxHAUTEUR[@TAUX])"))?;
+            .ok_or_else(|| anyhow!(t!("monitor.invalid_mode", value = s).to_string()))?;
         Ok(Mode {
             width: w
                 .trim()
                 .parse()
-                .map_err(|_| anyhow!("largeur invalide dans « {s} »"))?,
+                .map_err(|_| anyhow!(t!("monitor.invalid_width", value = s).to_string()))?,
             height: h
                 .trim()
                 .parse()
-                .map_err(|_| anyhow!("hauteur invalide dans « {s} »"))?,
+                .map_err(|_| anyhow!(t!("monitor.invalid_height", value = s).to_string()))?,
             refresh,
         })
     }
@@ -174,10 +186,10 @@ fn default_scale() -> f64 {
     1.0
 }
 
-/// Un écran tel que rapporté par `j/monitors all`.
+/// A monitor as reported by `j/monitors all`.
 ///
-/// Les champs non listés ici sont ignorés volontairement : Hyprland en ajoute
-/// régulièrement et `serde` les écarte sans casser la désérialisation.
+/// Fields not listed here are deliberately ignored: Hyprland adds new ones
+/// regularly, and `serde` drops them without breaking deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Monitor {
     #[serde(default)]
@@ -226,12 +238,12 @@ impl Monitor {
         Transform::from_u8(self.transform).unwrap_or_default()
     }
 
-    /// Écran dupliqué par celui-ci, résolu en nom de connecteur.
+    /// The output mirrored by this one, resolved to a connector name.
     ///
-    /// Hyprland publie ici l'**identifiant numérique** du moniteur source
-    /// (`"0"`), alors que la directive de configuration attend son nom
-    /// (`eDP-1`) : sans cette résolution, toute comparaison échouerait.
-    /// Les versions qui publient directement un nom restent gérées.
+    /// Hyprland publishes the source monitor's **numeric id** here
+    /// (`"0"`), whereas the configuration directive expects its name
+    /// (`eDP-1`): without this resolution, any comparison would fail.
+    /// Versions that publish a name directly are still handled.
     pub fn mirror_target(&self, all: &[Monitor]) -> Option<String> {
         let raw = self.mirror_of.trim();
         if raw.is_empty() || raw == "none" {
@@ -245,12 +257,12 @@ impl Monitor {
         Some(raw.to_string())
     }
 
-    /// Identifiant stable d'un écran, indépendant du connecteur sur lequel il
-    /// est branché : `"make model serial"`.
+    /// Stable identifier for a monitor, independent of the connector it is
+    /// plugged into: `"make model serial"`.
     ///
-    /// Certains écrans (dalles de portable notamment) ne publient ni serial ni
-    /// make exploitables — on retombe alors sur la description, puis sur le nom
-    /// du connecteur.
+    /// Some monitors (laptop panels in particular) don't publish a usable
+    /// serial or make — we then fall back to the description, then to the
+    /// connector name.
     pub fn fingerprint(&self) -> String {
         let parts: Vec<&str> = [
             self.make.as_str(),
@@ -270,21 +282,21 @@ impl Monitor {
         self.name.clone()
     }
 
-    /// Toutes les chaînes par lesquelles une règle de profil peut désigner cet
-    /// écran, de la plus spécifique à la plus générique.
+    /// Every string by which a profile rule can designate this monitor, from
+    /// the most specific to the most generic.
     pub fn identifiers(&self) -> Vec<String> {
         let mut ids = vec![self.name.clone(), self.fingerprint()];
         let desc = self.description.trim();
         if !desc.is_empty() {
             ids.push(desc.to_string());
-            // Hyprland accepte aussi la forme `desc:<description>`.
+            // Hyprland also accepts the `desc:<description>` form.
             ids.push(format!("desc:{desc}"));
         }
         ids.dedup();
         ids
     }
 
-    /// Modes disponibles, analysés et dédupliqués.
+    /// Available modes, parsed and deduplicated.
     pub fn parsed_modes(&self) -> Vec<Mode> {
         let mut modes: Vec<Mode> = self
             .available_modes
@@ -299,7 +311,7 @@ impl Monitor {
         modes
     }
 
-    /// Mode préféré : le plus grand, puis le plus rapide.
+    /// Preferred mode: the largest, then the fastest.
     pub fn preferred_mode(&self) -> Option<Mode> {
         self.parsed_modes().into_iter().next()
     }
@@ -313,7 +325,7 @@ mod tests {
     fn transform_encode_decode_roundtrip() {
         for v in 0u8..=7 {
             let t = Transform::from_u8(v).unwrap();
-            assert_eq!(t.to_u8(), v, "aller-retour cassé pour transform={v}");
+            assert_eq!(t.to_u8(), v, "round trip broken for transform={v}");
         }
         assert!(Transform::from_u8(8).is_err());
     }
@@ -396,7 +408,7 @@ mod tests {
 
     #[test]
     fn fingerprint_skips_empty_parts() {
-        // Cas réel de la dalle de portable : serial vide.
+        // Real-world case: laptop panel with an empty serial.
         let m = sample("AU Optronics", "0x5799", "", "AU Optronics 0x5799");
         assert_eq!(m.fingerprint(), "AU Optronics 0x5799");
     }
@@ -423,7 +435,7 @@ mod tests {
 
     #[test]
     fn mirror_target_resolves_the_numeric_id_hyprland_publishes() {
-        // Hyprland rapporte « mirrorOf: "0" » pour désigner l'écran d'identifiant 0.
+        // Hyprland reports mirrorOf: "0" to designate the monitor with id 0.
         let mut source = sample("x", "y", "z", "");
         source.id = 0;
         source.name = "eDP-1".into();

@@ -1,48 +1,59 @@
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>hyprmc — écrans</title>
+  <!--
+    Localization convention (see app.js for the implementation):
+      - `data-i18n="web.some.key"` fills the element's text content at
+        runtime from the key's translation.
+      - `data-i18n-attr="attr1:web.key1,attr2:web.key2"` fills one or more
+        attributes instead of the text content (comma-separated
+        `attribute:key` pairs).
+    The static text/attributes already in this file are the English
+    defaults: they are what stays on screen if `/api/i18n` cannot be
+    reached, so the page never renders blank.
+  -->
+  <title data-i18n="web.title">hyprdmc — displays</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header>
-    <h1>hyprmc</h1>
+    <h1>hyprdmc</h1>
     <span id="profile-badge" class="badge" hidden></span>
     <span class="spacer"></span>
-    <span id="connection" class="dot" title="connexion au démon"></span>
+    <span id="connection" class="dot" data-i18n-attr="title:web.connection" title="connection to the daemon"></span>
   </header>
 
   <div id="guard" class="guard" hidden>
-    <span id="guard-text">Configuration appliquée.</span>
-    <button id="btn-confirm" class="primary">Conserver</button>
-    <button id="btn-revert">Revenir en arrière</button>
+    <span id="guard-text">Configuration applied.</span>
+    <button id="btn-confirm" class="primary" data-i18n="web.guard.keep">Keep</button>
+    <button id="btn-revert" data-i18n="web.guard.revert">Revert</button>
   </div>
 
   <div id="issues" class="issues" hidden></div>
 
   <main>
     <section class="stage">
-      <div id="canvas" class="canvas" tabindex="0" aria-label="Disposition des écrans"></div>
-      <p class="hint">
-        Glissez un écran pour le déplacer — il s'aimante aux bords voisins.
-        Flèches du clavier pour un réglage fin.
+      <div id="canvas" class="canvas" tabindex="0" data-i18n-attr="aria-label:web.canvas_label" aria-label="Display arrangement"></div>
+      <p class="hint" data-i18n="web.hint">
+        Drag an output to move it — it snaps to neighbouring edges.
+        Arrow keys for fine adjustment.
       </p>
     </section>
 
     <aside id="panel" class="panel">
-      <p class="empty">Sélectionnez un écran pour le configurer.</p>
+      <p class="empty" data-i18n="web.select_prompt">Select an output to configure it.</p>
     </aside>
   </main>
 
   <footer>
-    <button id="btn-apply" class="primary">Appliquer</button>
-    <button id="btn-reset">Annuler les modifications</button>
-    <button id="btn-auto">Ranger automatiquement</button>
+    <button id="btn-apply" class="primary" data-i18n="web.action.apply">Apply</button>
+    <button id="btn-reset" data-i18n="web.action.reset">Discard changes</button>
+    <button id="btn-auto" data-i18n="web.action.auto">Arrange automatically</button>
     <span class="spacer"></span>
-    <button id="btn-save">Enregistrer comme profil…</button>
-    <button id="btn-persist">Rendre permanent</button>
+    <button id="btn-save" data-i18n="web.action.save">Save as profile…</button>
+    <button id="btn-persist" data-i18n="web.action.persist">Make permanent</button>
   </footer>
 
   <div id="toast" class="toast" hidden></div>

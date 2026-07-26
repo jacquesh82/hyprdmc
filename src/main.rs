@@ -1,4 +1,4 @@
-//! Point d'entrée : traduction des commandes en opérations sur l'agencement.
+//! Entry point: translates commands into operations on the layout.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -7,18 +7,32 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_BORDERS_ONLY};
+use rust_i18n::t;
 
-use hyprmc::apply::{self, ApplyReport};
-use hyprmc::cli::{Cli, Command, ProfileAction, SafetyArgs, SetArgs, WebArgs};
-use hyprmc::config::{Config, OutputRule, Profile, config_path, hyprland_conf, parse_position};
-use hyprmc::daemon::{self};
-use hyprmc::emit;
-use hyprmc::ipc::{HyprBackend, HyprSocket};
-use hyprmc::layout::{Layout, Relation, Severity, format_scale};
-use hyprmc::monitor::{Mode, Monitor, Rotation, Transform};
+// `main.rs` is its own crate root (the binary target), separate from the
+// `hyprdmc` library crate: `t!()` needs this invocation here too, even
+// though the library already has one in `src/lib.rs`.
+rust_i18n::i18n!("locales", fallback = "en");
+
+use hyprdmc::apply::{self, ApplyReport};
+use hyprdmc::browser;
+use hyprdmc::cli::{Cli, Command, ProfileAction, SafetyArgs, SetArgs, WebArgs};
+use hyprdmc::config::{Config, OutputRule, Profile, config_path, hyprland_conf, parse_position};
+use hyprdmc::daemon::{self, AppState};
+use hyprdmc::emit;
+use hyprdmc::ipc::{HyprBackend, HyprSocket};
+use hyprdmc::layout::{Layout, Relation, Severity, format_scale};
+use hyprdmc::monitor::{Mode, Monitor, Rotation, Transform};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Language first, so that even a failure reported below is readable.
+    // A broken config must not prevent the program from speaking: fall back
+    // to the environment rather than propagating the error here — the real
+    // parse error surfaces later, when the command actually needs the config.
+    let preference = Config::load().ok().and_then(|c| c.settings.language);
+    hyprdmc::i18n::init(preference.as_deref());
+
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
@@ -39,11 +53,11 @@ async fn main() -> Result<()> {
 
 fn init_tracing(verbose: bool) {
     let default = if verbose {
-        "hyprmc=debug"
+        "hyprdmc=debug"
     } else {
-        "hyprmc=info"
+        "hyprdmc=info"
     };
-    let filter = tracing_subscriber::EnvFilter::try_from_env("HYPRMC_LOG")
+    let filter = tracing_subscriber::EnvFilter::try_from_env("HYPRDMC_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -53,10 +67,10 @@ fn init_tracing(verbose: bool) {
 }
 
 fn backend() -> Result<HyprSocket> {
-    HyprSocket::connect().context("Hyprland ne semble pas accessible")
+    HyprSocket::connect().context(t!("ipc.unreachable").to_string())
 }
 
-// ---------------------------------------------------------------- lecture ---
+// ------------------------------------------------------------------ reading --
 
 fn cmd_list(json: bool) -> Result<()> {
     let monitors = backend()?.monitors()?;
@@ -65,7 +79,7 @@ fn cmd_list(json: bool) -> Result<()> {
         return Ok(());
     }
     if monitors.is_empty() {
-        println!("Aucun écran détecté.");
+        println!("{}", t!("cli.no_outputs"));
         return Ok(());
     }
 
@@ -74,24 +88,24 @@ fn cmd_list(json: bool) -> Result<()> {
         .load_preset(UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![
-            "Écran",
-            "État",
-            "Mode",
-            "Position",
-            "Échelle",
-            "Orientation",
-            "Identifiant",
+            t!("cli.table.output").to_string(),
+            t!("cli.table.state").to_string(),
+            t!("cli.table.mode").to_string(),
+            t!("cli.table.position").to_string(),
+            t!("cli.table.scale").to_string(),
+            t!("cli.table.orientation").to_string(),
+            t!("cli.table.identifier").to_string(),
         ]);
 
     for m in &monitors {
         let state = if m.disabled {
-            "désactivé".to_string()
+            t!("cli.state.disabled").to_string()
         } else if let Some(target) = m.mirror_target(&monitors) {
-            format!("miroir de {target}")
+            t!("cli.state.mirror", target = target).to_string()
         } else if m.focused {
-            "actif (focus)".to_string()
+            t!("cli.state.focused").to_string()
         } else {
-            "actif".to_string()
+            t!("cli.state.active").to_string()
         };
         let dash = |s: String| if m.disabled { "—".to_string() } else { s };
         table.add_row(vec![
@@ -112,14 +126,14 @@ fn cmd_list(json: bool) -> Result<()> {
 
 fn print_issues(layout: &Layout) {
     for issue in layout.validate() {
-        eprintln!("{} : {}", severity_label(issue.severity), issue.message);
+        eprintln!("{}: {}", severity_label(issue.severity), issue.message);
     }
 }
 
-fn severity_label(severity: Severity) -> &'static str {
+fn severity_label(severity: Severity) -> String {
     match severity {
-        Severity::Error => "erreur",
-        Severity::Warning => "attention",
+        Severity::Error => t!("layout.severity.error").to_string(),
+        Severity::Warning => t!("layout.severity.warning").to_string(),
     }
 }
 
@@ -127,7 +141,7 @@ fn cmd_modes(output: &str) -> Result<()> {
     let monitors = backend()?.monitors()?;
     let m = find(&monitors, output)?;
     if m.available_modes.is_empty() {
-        println!("Aucun mode rapporté pour « {output} ».");
+        println!("{}", t!("cli.no_modes", name = output));
         return Ok(());
     }
     let current = m.mode();
@@ -135,25 +149,28 @@ fn cmd_modes(output: &str) -> Result<()> {
         let is_current = mode.width == current.width
             && mode.height == current.height
             && (mode.refresh - current.refresh).abs() < 0.5;
-        println!("{mode}{}", if is_current { " (actuel)" } else { "" });
+        let marker = if is_current {
+            format!(" ({})", t!("cli.current"))
+        } else {
+            String::new()
+        };
+        println!("{mode}{marker}");
     }
     Ok(())
 }
 
 fn find<'a>(monitors: &'a [Monitor], name: &str) -> Result<&'a Monitor> {
     monitors.iter().find(|m| m.name == name).ok_or_else(|| {
-        anyhow!(
-            "écran « {name} » introuvable (connus : {})",
-            monitors
-                .iter()
-                .map(|m| m.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        let known = monitors
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow!(t!("cli.unknown_output", name = name, known = known).to_string())
     })
 }
 
-// ------------------------------------------------------------ modification ---
+// -------------------------------------------------------------- modification --
 
 fn cmd_set(args: SetArgs) -> Result<()> {
     let hypr = backend()?;
@@ -165,7 +182,7 @@ fn cmd_set(args: SetArgs) -> Result<()> {
     {
         let o = layout
             .get_mut(&args.output)
-            .expect("l'écran vient d'être vérifié");
+            .expect("the output was just checked");
 
         if let Some(mode) = &args.mode {
             o.mode = match mode.as_str() {
@@ -209,8 +226,8 @@ fn cmd_set(args: SetArgs) -> Result<()> {
             o.vrr = vrr;
         }
 
-        // La taille logique — donc la détection de chevauchement — dépend du
-        // mode : il faut le résoudre avant de valider.
+        // The logical size — and therefore overlap detection — depends on the
+        // mode: it must be resolved before validating.
         if o.mode.is_none() {
             o.mode = preferred;
         }
@@ -220,17 +237,14 @@ fn cmd_set(args: SetArgs) -> Result<()> {
 
     if let Some(name) = &args.save {
         save_profile(name, false, &layout, &monitors)?;
-        println!("Profil « {name} » enregistré.");
+        println!("{}", t!("cli.profile_saved", name = name));
     }
     Ok(())
 }
 
 fn cmd_arrange(spec: &[String], safety: SafetyArgs) -> Result<()> {
     if !spec.len().is_multiple_of(3) {
-        bail!(
-            "arrange attend des triplets « ÉCRAN RELATION RÉFÉRENCE » ({} argument(s) reçu(s))",
-            spec.len()
-        );
+        bail!(t!("cli.arrange_expects_triples", count = spec.len()).to_string());
     }
     let hypr = backend()?;
     let mut layout = Layout::from_monitors(&hypr.monitors()?);
@@ -251,15 +265,15 @@ fn cmd_auto(safety: SafetyArgs) -> Result<()> {
     apply_interactively(&hypr, &layout, safety)
 }
 
-/// Applique un agencement puis, dans un terminal, propose de revenir en
-/// arrière — c'est ce qui évite de rester bloqué devant un écran noir.
+/// Applies a layout then, in a terminal, offers to revert — this is what
+/// avoids being stuck in front of a black screen.
 fn apply_interactively(hypr: &HyprSocket, layout: &Layout, safety: SafetyArgs) -> Result<()> {
     let previous = apply::snapshot(hypr)?;
     let report = apply::apply(hypr, layout, safety.force)?;
     print_report(&report);
 
     if report.rolled_back {
-        bail!("configuration non appliquée : l'état précédent a été restauré");
+        bail!(t!("apply.not_applied").to_string());
     }
     if safety.no_confirm {
         return Ok(());
@@ -267,7 +281,7 @@ fn apply_interactively(hypr: &HyprSocket, layout: &Layout, safety: SafetyArgs) -
 
     let timeout = Duration::from_secs(Config::load()?.settings.confirm_timeout_secs);
     if !apply::confirm_or_revert(hypr, &previous, timeout)? {
-        println!("Retour à la configuration précédente.");
+        println!("{}", t!("apply.reverted"));
     }
     Ok(())
 }
@@ -278,10 +292,10 @@ fn print_report(report: &ApplyReport) {
         .iter()
         .filter(|i| i.severity == Severity::Warning)
     {
-        eprintln!("attention : {}", issue.message);
+        eprintln!("{}: {}", t!("layout.severity.warning"), issue.message);
     }
     for drift in &report.drifts {
-        eprintln!("{} : {}", severity_label(drift.severity), drift.message);
+        eprintln!("{}: {}", severity_label(drift.severity), drift.message);
     }
     if report.succeeded() {
         for spec in &report.specs {
@@ -290,7 +304,7 @@ fn print_report(report: &ApplyReport) {
     }
 }
 
-// ----------------------------------------------------------------- profils ---
+// ------------------------------------------------------------------ profiles --
 
 fn cmd_profile(action: ProfileAction) -> Result<()> {
     match action {
@@ -300,7 +314,7 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
             let cfg = Config::load()?;
             let profile = cfg
                 .profile(&name)
-                .ok_or_else(|| anyhow!("profil « {name} » inconnu"))?;
+                .ok_or_else(|| anyhow!(t!("config.unknown_profile", name = name).to_string()))?;
             print!("{}", toml::to_string_pretty(profile)?);
             Ok(())
         }
@@ -308,10 +322,8 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
         ProfileAction::Save { name, exact } => {
             let monitors = backend()?.monitors()?;
             save_profile(&name, exact, &Layout::from_monitors(&monitors), &monitors)?;
-            println!(
-                "Profil « {name} » enregistré dans {}.",
-                config_path().display()
-            );
+            let path = config_path().display().to_string();
+            println!("{}", t!("cli.profile_saved_in", name = name, path = path));
             Ok(())
         }
 
@@ -321,7 +333,7 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
             let cfg = Config::load()?;
             let profile = cfg
                 .profile(&name)
-                .ok_or_else(|| anyhow!("profil « {name} » inconnu"))?;
+                .ok_or_else(|| anyhow!(t!("config.unknown_profile", name = name).to_string()))?;
             let layout = profile.resolve(&monitors)?;
             apply_interactively(&hypr, &layout, safety)
         }
@@ -330,7 +342,7 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
             let mut cfg = Config::load()?;
             cfg.remove(&name)?;
             cfg.save()?;
-            println!("Profil « {name} » supprimé.");
+            println!("{}", t!("cli.profile_deleted", name = name));
             Ok(())
         }
 
@@ -340,13 +352,13 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
                 name: to.clone(),
                 ..cfg
                     .profile(&from)
-                    .ok_or_else(|| anyhow!("profil « {from} » inconnu"))?
+                    .ok_or_else(|| anyhow!(t!("config.unknown_profile", name = from).to_string()))?
                     .clone()
             };
             cfg.remove(&from)?;
             cfg.upsert(renamed);
             cfg.save()?;
-            println!("Profil « {from} » renommé en « {to} ».");
+            println!("{}", t!("cli.profile_renamed", from = from, to = to));
             Ok(())
         }
     }
@@ -355,14 +367,12 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
 fn cmd_profile_list() -> Result<()> {
     let cfg = Config::load()?;
     if cfg.profiles.is_empty() {
-        println!(
-            "Aucun profil. Créez-en un avec « hyprmc profile save <nom> ».\nFichier : {}",
-            config_path().display()
-        );
+        let path = config_path().display().to_string();
+        println!("{}", t!("cli.no_profiles", path = path));
         return Ok(());
     }
 
-    // La liste doit rester consultable même sans Hyprland en fonctionnement.
+    // The list must stay readable even without Hyprland running.
     let monitors = backend().and_then(|b| b.monitors()).unwrap_or_default();
     let active = cfg.best_match(&monitors).map(|p| p.name.clone());
 
@@ -370,7 +380,12 @@ fn cmd_profile_list() -> Result<()> {
     table
         .load_preset(UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["Profil", "Écrans", "Exact", "Correspond"]);
+        .set_header(vec![
+            t!("cli.table.profile").to_string(),
+            t!("cli.table.outputs").to_string(),
+            t!("cli.table.exact").to_string(),
+            t!("cli.table.matches").to_string(),
+        ]);
     for p in &cfg.profiles {
         table.add_row(vec![
             Cell::new(&p.name),
@@ -381,13 +396,17 @@ fn cmd_profile_list() -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
-            Cell::new(if p.exact { "oui" } else { "non" }),
-            Cell::new(if active.as_deref() == Some(p.name.as_str()) {
-                "← actif"
-            } else if p.matches(&monitors) {
-                "oui"
+            Cell::new(if p.exact {
+                t!("cli.yes").to_string()
             } else {
-                "non"
+                t!("cli.no").to_string()
+            }),
+            Cell::new(if active.as_deref() == Some(p.name.as_str()) {
+                t!("cli.active_marker").to_string()
+            } else if p.matches(&monitors) {
+                t!("cli.yes").to_string()
+            } else {
+                t!("cli.no").to_string()
             }),
         ]);
     }
@@ -395,8 +414,8 @@ fn cmd_profile_list() -> Result<()> {
     Ok(())
 }
 
-/// Enregistre un agencement en désignant les écrans par leur empreinte, pour
-/// que le profil résiste à un changement de connecteur.
+/// Saves a layout identifying outputs by their fingerprint, so that the
+/// profile survives a change of connector.
 fn save_profile(name: &str, exact: bool, layout: &Layout, monitors: &[Monitor]) -> Result<()> {
     let mut cfg = Config::load()?;
     cfg.upsert(Profile {
@@ -419,11 +438,11 @@ fn cmd_apply_for_hardware(safety: SafetyArgs) -> Result<()> {
 
     let layout = match cfg.best_match(&monitors) {
         Some(profile) => {
-            println!("Profil correspondant : « {} ».", profile.name);
+            println!("{}", t!("cli.matching_profile", name = &profile.name));
             profile.resolve(&monitors)?
         }
         None => {
-            println!("Aucun profil ne correspond : rangement automatique.");
+            println!("{}", t!("cli.no_matching_profile"));
             let mut layout = Layout::from_monitors(&monitors);
             layout.auto_arrange();
             layout
@@ -432,7 +451,7 @@ fn cmd_apply_for_hardware(safety: SafetyArgs) -> Result<()> {
     apply_interactively(&hypr, &layout, safety)
 }
 
-// ------------------------------------------------------------- persistance ---
+// ----------------------------------------------------------------- persistence --
 
 fn cmd_persist() -> Result<()> {
     let monitors = backend()?.monitors()?;
@@ -441,16 +460,12 @@ fn cmd_persist() -> Result<()> {
         &Layout::from_monitors(&monitors),
         &cfg.settings.monitors_conf,
     )?;
-    println!(
-        "Agencement écrit dans {}.",
-        cfg.settings.monitors_conf.display()
-    );
+    let path = cfg.settings.monitors_conf.display().to_string();
+    println!("{}", t!("cli.persisted", path = path));
 
     if !sources_monitors_conf(&hyprland_conf()) {
-        println!(
-            "Attention : {} ne source pas encore ce fichier. Lancez « hyprmc init ».",
-            hyprland_conf().display()
-        );
+        let path = hyprland_conf().display().to_string();
+        println!("{}", t!("cli.not_sourced", path = path));
     }
     Ok(())
 }
@@ -470,50 +485,51 @@ fn cmd_init(dry_run: bool) -> Result<()> {
     let report = emit::run_init(&hypr_conf, &cfg.settings.monitors_conf, dry_run)?;
 
     if report.already_wired {
+        let conf = hypr_conf.display().to_string();
+        let target = cfg.settings.monitors_conf.display().to_string();
         println!(
-            "{} source déjà {}. Rien à faire.",
-            hypr_conf.display(),
-            cfg.settings.monitors_conf.display()
+            "{}",
+            t!("cli.init.already_wired", conf = conf, target = target)
         );
         return Ok(());
     }
 
     if dry_run {
-        println!("--- {} (simulation) ---", hypr_conf.display());
+        let path = hypr_conf.display().to_string();
+        println!("{}", t!("cli.init.dry_run_header", path = path));
         print!("{}", report.new_conf);
         return Ok(());
     }
 
     if let Some(backup) = &report.backup {
-        println!("Sauvegarde : {}", backup.display());
+        let path = backup.display().to_string();
+        println!("{}", t!("cli.init.backup", path = path));
     }
     println!(
-        "Ajout de « source = {} ».",
-        emit::tildify(&cfg.settings.monitors_conf)
+        "{}",
+        t!(
+            "cli.init.source_added",
+            path = emit::tildify(&cfg.settings.monitors_conf)
+        )
     );
     if !report.adopted.is_empty() {
-        println!(
-            "{} directive(s) monitor reprise(s) et commentée(s) dans hyprland.conf.",
-            report.adopted.len()
-        );
+        println!("{}", t!("cli.init.adopted", count = report.adopted.len()));
     }
 
-    // L'agencement courant est écrit tout de suite : au prochain rechargement,
-    // l'affichage doit rester exactement tel qu'il est.
+    // The current layout is written right away: on the next reload, the
+    // display must stay exactly as it is now.
     let monitors = backend()?.monitors()?;
     emit::persist(
         &Layout::from_monitors(&monitors),
         &cfg.settings.monitors_conf,
     )?;
-    println!(
-        "Agencement courant écrit dans {}.",
-        cfg.settings.monitors_conf.display()
-    );
-    println!("Rechargez avec « hyprctl reload ».");
+    let path = cfg.settings.monitors_conf.display().to_string();
+    println!("{}", t!("cli.persisted", path = path));
+    println!("{}", t!("cli.init.reload_hint"));
     Ok(())
 }
 
-// ------------------------------------------------------------------ démon ---
+// ---------------------------------------------------------------------- daemon --
 
 fn web_addr(cfg: &Config, args: &WebArgs) -> Result<SocketAddr> {
     let ip: IpAddr = args
@@ -521,11 +537,44 @@ fn web_addr(cfg: &Config, args: &WebArgs) -> Result<SocketAddr> {
         .as_deref()
         .unwrap_or(&cfg.settings.bind)
         .parse()
-        .context("adresse d'écoute invalide")?;
+        .context(t!("cli.invalid_bind").to_string())?;
     Ok(SocketAddr::new(
         ip,
         args.port.unwrap_or(cfg.settings.web_port),
     ))
+}
+
+/// Starts the web server and hands back the URL it is reachable at.
+///
+/// The listener is bound here rather than inside the server task so that the
+/// browser is only pointed at the port once it is genuinely accepting
+/// connections, and so that `--port 0` resolves to the real port.
+async fn start_web(state: &Arc<AppState>, addr: SocketAddr) -> Result<String> {
+    let listener = hyprdmc::web::bind(addr).await?;
+    let url = browser::reachable_url(listener.local_addr()?);
+    tracing::info!("web interface: {url}");
+
+    let web_state = Arc::clone(state);
+    tokio::spawn(async move {
+        if let Err(err) = hyprdmc::web::serve_on(listener, web_state).await {
+            tracing::error!("web interface stopped: {err:#}");
+        }
+    });
+    Ok(url)
+}
+
+/// Opens the UI in a browser, reporting rather than failing if it cannot.
+///
+/// The server is up and the URL has been printed either way, so a missing
+/// `xdg-open` or a headless session is an inconvenience, not an error.
+fn offer_browser(url: &str) {
+    match browser::open(url) {
+        Ok(()) => println!("{}", t!("cli.web.opening", url = url)),
+        Err(err) => println!(
+            "{}",
+            t!("cli.web.open_failed", url = url, error = err.to_string())
+        ),
+    }
 }
 
 async fn cmd_daemon(args: WebArgs, with_web: bool) -> Result<()> {
@@ -533,20 +582,31 @@ async fn cmd_daemon(args: WebArgs, with_web: bool) -> Result<()> {
     let addr = web_addr(&*state.config.read().await, &args)?;
 
     if with_web {
-        let web_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(err) = hyprmc::web::serve(web_state, addr).await {
-                tracing::error!("interface web arrêtée : {err:#}");
-            }
-        });
+        let url = start_web(&state, addr).await?;
+        println!("{}", t!("cli.web.listening", url = &url));
+        // A daemon usually starts with the session: opening a browser then
+        // would be intrusive, so it takes an explicit --open.
+        if args.should_open(false) {
+            offer_browser(&url);
+        }
     }
 
-    tracing::info!("surveillance du branchement à chaud active");
+    tracing::info!("hotplug monitoring active");
     daemon::run(state, &hypr).await
 }
 
 async fn cmd_web(args: WebArgs) -> Result<()> {
     let (state, _) = daemon::bootstrap()?;
     let addr = web_addr(&*state.config.read().await, &args)?;
-    hyprmc::web::serve(state, addr).await
+
+    let url = start_web(&state, addr).await?;
+    println!("{}", t!("cli.web.listening", url = &url));
+    // `web` exists to be used interactively: opening the page is the point.
+    if args.should_open(true) {
+        offer_browser(&url);
+    }
+
+    // Nothing else to do here: the server owns the process until Ctrl-C.
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }

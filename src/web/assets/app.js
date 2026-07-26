@@ -1,28 +1,117 @@
 'use strict';
 
-// Toute la logique tient dans ce fichier : pas de dépendance, pas d'étape de
-// compilation. L'état vient du démon (SSE), le brouillon vit ici jusqu'à ce que
-// l'utilisateur clique sur « Appliquer ».
+// All the logic lives in this single file: no dependency, no build step.
+// State comes from the daemon (SSE), the draft lives here until the user
+// clicks "Apply".
 
-const SNAP = 60;            // aimantation, en pixels logiques
+const SNAP = 60;            // snapping distance, in logical pixels
 const ROTATIONS = [0, 90, 180, 270];
 
 const el = (id) => document.getElementById(id);
 const canvas = el('canvas');
 const panel = el('panel');
 
-let live = null;            // dernier état reçu du démon
-let draft = [];             // agencement en cours d'édition
-let selected = null;        // nom du connecteur sélectionné
-let dirty = false;          // le brouillon diverge de l'état live
+let live = null;            // last state received from the daemon
+let draft = [];             // layout currently being edited
+let selected = null;        // name of the selected connector
+let dirty = false;          // the draft diverges from the live state
 let guardTimer = null;
 
-// ----------------------------------------------------------------- modèle ---
+// -------------------------------------------------------------------- i18n --
+
+// English fallback used if `/api/i18n` cannot be reached, so the UI never
+// depends on the network for its own language. Kept in sync by hand with the
+// `web.*` section of `locales/app.yml`.
+const I18N_DEFAULTS = {
+  'web.title': 'hyprdmc — displays',
+  'web.profile_badge': 'profile: %{name}',
+  'web.connection': 'connection to the daemon',
+  'web.canvas_label': 'Display arrangement',
+  'web.hint': "Drag an output to move it — it snaps to neighbouring edges. Arrow keys for fine adjustment.",
+  'web.select_prompt': 'Select an output to configure it.',
+  'web.guard.applied': 'Configuration applied. Automatic revert in %{seconds}s.',
+  'web.guard.keep': 'Keep',
+  'web.guard.revert': 'Revert',
+  'web.action.apply': 'Apply',
+  'web.action.reset': 'Discard changes',
+  'web.action.auto': 'Arrange automatically',
+  'web.action.save': 'Save as profile…',
+  'web.action.persist': 'Make permanent',
+  'web.field.enabled': 'Output enabled',
+  'web.field.mode': 'Mode',
+  'web.field.scale': 'Scale',
+  'web.field.rotation': 'Rotation',
+  'web.field.flip': 'Flip the image',
+  'web.field.mirror': 'Mirror',
+  'web.field.vrr': 'Variable refresh rate (VRR)',
+  'web.mirror.none': 'none',
+  'web.screen.disabled': 'disabled',
+  'web.screen.flipped': 'flipped',
+  'web.prompt.profile_name': 'Profile name?',
+  'web.toast.applied': 'Configuration applied.',
+  'web.toast.rolled_back': 'Hyprland did not apply the configuration: previous state restored.',
+  'web.toast.kept': 'Configuration kept.',
+  'web.toast.reverted': 'Previous configuration restored.',
+  'web.toast.profile_saved': 'Profile "%{name}" saved.',
+  'web.toast.persisted': 'Layout written to %{path}.',
+  'web.issue.overlap': '"%{a}" and "%{b}" overlap',
+  'web.issue.all_disabled': 'every output would be disabled',
+  'web.issue.mirror_unavailable': '"%{name}" mirrors an unavailable output',
+  'web.not_found': 'not found',
+};
+
+let i18nStrings = {};
+
+/**
+ * Translates `key`, substituting `%{name}` placeholders from `vars`.
+ *
+ * Resolution order: the strings fetched from `/api/i18n`, then the built-in
+ * English default, then the key's last segment — so a missing key or a
+ * failed fetch degrades gracefully instead of leaving the UI blank.
+ */
+function t(key, vars) {
+  const template = i18nStrings[key] ?? I18N_DEFAULTS[key] ?? key.split('.').pop();
+  if (!vars) return template;
+  return template.replace(/%\{(\w+)\}/g, (match, name) => (name in vars ? String(vars[name]) : match));
+}
+
+/** Fetches the active locale's strings. Never throws: falls back to English. */
+async function loadI18n() {
+  try {
+    const data = await api('/api/i18n');
+    i18nStrings = data.strings ?? {};
+    if (data.locale) document.documentElement.lang = data.locale;
+  } catch (err) {
+    console.error('translations unavailable, falling back to English defaults', err);
+    i18nStrings = {};
+  }
+}
+
+/**
+ * Applies translations to the static markup.
+ *
+ * Convention: `data-i18n="web.some.key"` sets the element's text content;
+ * `data-i18n-attr="attr1:web.key1,attr2:web.key2"` sets one or more
+ * attributes instead (comma-separated `attribute:key` pairs).
+ */
+function applyStaticI18n() {
+  for (const node of document.querySelectorAll('[data-i18n]')) {
+    node.textContent = t(node.dataset.i18n);
+  }
+  for (const node of document.querySelectorAll('[data-i18n-attr]')) {
+    for (const pair of node.dataset.i18nAttr.split(',')) {
+      const [attr, key] = pair.split(':');
+      node.setAttribute(attr, t(key));
+    }
+  }
+}
+
+// ------------------------------------------------------------------ model --
 
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const byName = (name) => draft.find((o) => o.name === name);
 
-/** Taille occupée dans l'espace de travail : la rotation échange les axes. */
+/** Footprint in the workspace: rotation swaps the axes. */
 function logicalSize(o) {
   if (!o.mode) return [0, 0];
   const swap = o.transform.rotation === 'R90' || o.transform.rotation === 'R270';
@@ -46,7 +135,7 @@ function conflicting(name) {
   return draft.some((other) => other.name !== name && occupies(other) && overlaps(o, other));
 }
 
-// -------------------------------------------------------------- rendu 2D ---
+// --------------------------------------------------------------- 2D render --
 
 function bounds() {
   const boxes = draft.filter(occupies).map((o) => {
@@ -62,7 +151,7 @@ function bounds() {
   };
 }
 
-/** Facteur d'échelle et décalage pour faire tenir l'agencement dans le cadre. */
+/** Scale factor and offset to fit the layout inside the frame. */
 function viewport() {
   const b = bounds();
   const pad = 24;
@@ -82,7 +171,7 @@ function render() {
   const view = viewport();
   canvas.innerHTML = '';
 
-  // Les écrans désactivés sont dessinés en dernier, sous les autres.
+  // Disabled outputs are drawn last, underneath the others.
   for (const o of [...draft].sort((a, b) => Number(a.enabled) - Number(b.enabled))) {
     const [lw, lh] = logicalSize(o);
     const node = document.createElement('div');
@@ -108,8 +197,8 @@ function render() {
     detail.className = 'detail';
     detail.textContent = o.enabled
       ? `${lw}×${lh}${o.transform.rotation !== 'R0' ? ` · ${degrees(o)}°` : ''}` +
-        `${o.transform.flipped ? ' · inversé' : ''}${o.mirror_of ? ` · ⧉ ${o.mirror_of}` : ''}`
-      : 'désactivé';
+        `${o.transform.flipped ? ` · ${t('web.screen.flipped')}` : ''}${o.mirror_of ? ` · ⧉ ${o.mirror_of}` : ''}`
+      : t('web.screen.disabled');
     node.append(detail);
 
     node.addEventListener('pointerdown', onPointerDown);
@@ -124,7 +213,7 @@ function render() {
 
 const degrees = (o) => Number(o.transform.rotation.slice(1));
 
-// ------------------------------------------------------- glisser-déposer ---
+// ------------------------------------------------------------- drag-and-drop --
 
 function onPointerDown(event) {
   const node = event.currentTarget;
@@ -163,7 +252,7 @@ function onPointerDown(event) {
   event.preventDefault();
 }
 
-/** Colle l'écran contre ses voisins quand il en approche. */
+/** Snaps the output against its neighbours when it gets close to them. */
 function snap(o) {
   if (!occupies(o)) return;
   const [w, h] = logicalSize(o);
@@ -172,7 +261,7 @@ function snap(o) {
     if (other.name === o.name || !occupies(other)) continue;
     const [ow, oh] = logicalSize(other);
 
-    // Bords verticaux : droite contre gauche, gauche contre droite, alignement.
+    // Vertical edges: right against left, left against right, alignment.
     for (const [candidate, target] of [
       [o.x, other.x + ow], [o.x, other.x],
       [o.x + w, other.x], [o.x + w, other.x + ow],
@@ -188,7 +277,7 @@ function snap(o) {
   }
 }
 
-/** Ramène le coin supérieur gauche de l'ensemble à l'origine. */
+/** Brings the top-left corner of the whole set back to the origin. */
 function normalize() {
   const active = draft.filter(occupies);
   if (!active.length) return;
@@ -212,12 +301,13 @@ canvas.addEventListener('keydown', (event) => {
   render();
 });
 
-// ------------------------------------------------------------- panneau ---
+// ----------------------------------------------------------------- panel --
 
 function renderPanel() {
   const o = byName(selected);
   if (!o) {
-    panel.innerHTML = '<p class="empty">Sélectionnez un écran pour le configurer.</p>';
+    panel.innerHTML = '';
+    panel.append(node('p', t('web.select_prompt'), 'empty'));
     return;
   }
   const monitor = live?.monitors?.find((m) => m.name === o.name);
@@ -229,7 +319,7 @@ function renderPanel() {
     node('p', monitor ? `${monitor.make} ${monitor.model} ${monitor.serial}`.trim() : '', 'sub'),
   );
 
-  panel.append(field('', checkbox('Écran activé', o.enabled, (v) => { o.enabled = v; touch(); })));
+  panel.append(field('', checkbox(t('web.field.enabled'), o.enabled, (v) => { o.enabled = v; touch(); })));
 
   const modeSelect = document.createElement('select');
   for (const m of modes) {
@@ -244,7 +334,7 @@ function renderPanel() {
     if (match) modeSelect.value = match;
   }
   modeSelect.addEventListener('change', () => { o.mode = parseMode(modeSelect.value); touch(); });
-  panel.append(field('Mode', modeSelect));
+  panel.append(field(t('web.field.mode'), modeSelect));
 
   const scale = document.createElement('input');
   scale.type = 'number';
@@ -255,7 +345,7 @@ function renderPanel() {
     o.scale = Math.max(0.1, Number(scale.value) || 1);
     touch();
   });
-  panel.append(field('Échelle', scale));
+  panel.append(field(t('web.field.scale'), scale));
 
   const rotation = document.createElement('div');
   rotation.className = 'segmented';
@@ -266,9 +356,9 @@ function renderPanel() {
     button.addEventListener('click', () => { o.transform.rotation = `R${deg}`; touch(); });
     rotation.append(button);
   }
-  panel.append(field('Rotation', rotation));
+  panel.append(field(t('web.field.rotation'), rotation));
 
-  panel.append(field('', checkbox('Inverser l\'image', o.transform.flipped, (v) => {
+  panel.append(field('', checkbox(t('web.field.flip'), o.transform.flipped, (v) => {
     o.transform.flipped = v;
     touch();
   })));
@@ -276,7 +366,7 @@ function renderPanel() {
   const mirror = document.createElement('select');
   const none = document.createElement('option');
   none.value = '';
-  none.textContent = 'aucune';
+  none.textContent = t('web.mirror.none');
   mirror.append(none);
   for (const other of draft.filter((x) => x.name !== o.name && x.enabled)) {
     const option = document.createElement('option');
@@ -286,9 +376,9 @@ function renderPanel() {
   }
   mirror.value = o.mirror_of ?? '';
   mirror.addEventListener('change', () => { o.mirror_of = mirror.value || null; touch(); });
-  panel.append(field('Dupliquer', mirror));
+  panel.append(field(t('web.field.mirror'), mirror));
 
-  panel.append(field('', checkbox('Rafraîchissement variable (VRR)', o.vrr, (v) => { o.vrr = v; touch(); })));
+  panel.append(field('', checkbox(t('web.field.vrr'), o.vrr, (v) => { o.vrr = v; touch(); })));
 }
 
 function node(tag, text, className) {
@@ -328,9 +418,9 @@ function touch() {
   render();
 }
 
-// ----------------------------------------------------------- validation ---
+// ------------------------------------------------------------- validation --
 
-/** Reprend côté client les règles bloquantes, pour ne pas envoyer l'inutile. */
+/** Mirrors the blocking rules client-side, to avoid sending the pointless. */
 function localIssues() {
   const issues = [];
   const active = draft.filter(occupies);
@@ -338,17 +428,17 @@ function localIssues() {
   for (let i = 0; i < active.length; i += 1) {
     for (let j = i + 1; j < active.length; j += 1) {
       if (overlaps(active[i], active[j])) {
-        issues.push({ severity: 'error', message: `« ${active[i].name} » et « ${active[j].name} » se chevauchent` });
+        issues.push({ severity: 'error', message: t('web.issue.overlap', { a: active[i].name, b: active[j].name }) });
       }
     }
   }
   if (draft.length && !active.length) {
-    issues.push({ severity: 'error', message: 'tous les écrans seraient désactivés' });
+    issues.push({ severity: 'error', message: t('web.issue.all_disabled') });
   }
   for (const o of draft.filter((x) => x.enabled && x.mirror_of)) {
     const target = byName(o.mirror_of);
     if (!target || !target.enabled) {
-      issues.push({ severity: 'error', message: `« ${o.name} » duplique un écran indisponible` });
+      issues.push({ severity: 'error', message: t('web.issue.mirror_unavailable', { name: o.name }) });
     }
   }
   return issues;
@@ -374,7 +464,7 @@ function renderIssues() {
   el('btn-apply').disabled = issues.some((i) => i.severity === 'error');
 }
 
-// ---------------------------------------------------------------- réseau ---
+// --------------------------------------------------------------- network --
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -402,7 +492,7 @@ function adopt(state) {
     if (!byName(selected)) selected = draft[0]?.name ?? null;
   }
   el('profile-badge').hidden = !state.activeProfile;
-  el('profile-badge').textContent = state.activeProfile ? `profil : ${state.activeProfile}` : '';
+  el('profile-badge').textContent = state.activeProfile ? t('web.profile_badge', { name: state.activeProfile }) : '';
   showGuard(state.revertPending, state.confirmTimeoutSecs);
   render();
 }
@@ -417,8 +507,7 @@ function showGuard(pending, seconds) {
   guard.hidden = false;
   let left = seconds;
   const tick = () => {
-    el('guard-text').textContent =
-      `Configuration appliquée. Retour arrière automatique dans ${Math.max(left, 0)} s.`;
+    el('guard-text').textContent = t('web.guard.applied', { seconds: Math.max(left, 0) });
     if (left <= 0) clearInterval(guardTimer);
     left -= 1;
   };
@@ -434,12 +523,12 @@ function connect() {
     try {
       adopt(JSON.parse(event.data));
     } catch (err) {
-      console.error('état illisible', err);
+      console.error('unreadable state', err);
     }
   });
 }
 
-// --------------------------------------------------------------- actions ---
+// ------------------------------------------------------------------ actions --
 
 el('btn-apply').addEventListener('click', async () => {
   try {
@@ -449,10 +538,10 @@ el('btn-apply').addEventListener('click', async () => {
     });
     dirty = false;
     if (report.rolled_back) {
-      toast('Hyprland n\'a pas appliqué la configuration : état précédent restauré.', true);
+      toast(t('web.toast.rolled_back'), true);
     } else {
       const warnings = (report.drifts ?? []).map((d) => d.message);
-      toast(warnings.length ? warnings.join(' · ') : 'Configuration appliquée.');
+      toast(warnings.length ? warnings.join(' · ') : t('web.toast.applied'));
     }
     await refresh();
   } catch (err) {
@@ -477,26 +566,26 @@ el('btn-auto').addEventListener('click', () => {
 
 el('btn-confirm').addEventListener('click', async () => {
   await api('/api/confirm', { method: 'POST' });
-  toast('Configuration conservée.');
+  toast(t('web.toast.kept'));
   await refresh();
 });
 
 el('btn-revert').addEventListener('click', async () => {
   await api('/api/revert', { method: 'POST' });
   dirty = false;
-  toast('Configuration précédente restaurée.');
+  toast(t('web.toast.reverted'));
   await refresh();
 });
 
 el('btn-save').addEventListener('click', async () => {
-  const name = prompt('Nom du profil ?', live?.activeProfile ?? '');
+  const name = prompt(t('web.prompt.profile_name'), live?.activeProfile ?? '');
   if (!name) return;
   try {
     await api(`/api/profiles/${encodeURIComponent(name)}`, {
       method: 'PUT',
       body: JSON.stringify({ outputs: draft }),
     });
-    toast(`Profil « ${name} » enregistré.`);
+    toast(t('web.toast.profile_saved', { name }));
     await refresh();
   } catch (err) {
     toast(err.message, true);
@@ -506,7 +595,7 @@ el('btn-save').addEventListener('click', async () => {
 el('btn-persist').addEventListener('click', async () => {
   try {
     const res = await api('/api/persist', { method: 'POST' });
-    toast(`Agencement écrit dans ${res.path}.`);
+    toast(t('web.toast.persisted', { path: res.path }));
   } catch (err) {
     toast(err.message, true);
   }
@@ -522,4 +611,11 @@ async function refresh() {
 
 window.addEventListener('resize', () => render());
 
-refresh().then(connect);
+async function start() {
+  await loadI18n();
+  applyStaticI18n();
+  await refresh();
+  connect();
+}
+
+start();

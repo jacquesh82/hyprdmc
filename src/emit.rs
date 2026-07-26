@@ -1,58 +1,55 @@
-//! Persistance : génération de `monitors.conf` et branchement de ce fichier
-//! dans la configuration Hyprland de l'utilisateur.
+//! Persistence: generating `monitors.conf` and wiring that file into the
+//! user's Hyprland configuration.
 //!
-//! Principe directeur : `hyprmc` est seul maître de `monitors.conf` et ne
-//! touche à `hyprland.conf` qu'une seule fois, pour y ajouter un `source`.
+//! Guiding principle: `hyprdmc` is the sole owner of `monitors.conf` and
+//! only touches `hyprland.conf` once, to add a `source` line to it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+use rust_i18n::t;
 
 use crate::config::home;
 use crate::layout::Layout;
 
-const HEADER: &str = "\
-# Généré par hyprmc — NE PAS ÉDITER À LA MAIN.
-# Ce fichier est réécrit à chaque `hyprmc persist` ou application de profil.
-# Pour modifier l'agencement : `hyprmc set`, `hyprmc arrange`, ou l'interface web.
-";
-
-/// Écrit un fichier de façon atomique : fichier temporaire voisin puis
-/// `rename`, pour qu'aucun lecteur ne voie jamais un contenu partiel — Hyprland
-/// pourrait recharger la configuration au milieu de l'écriture.
+/// Writes a file atomically: a sibling temporary file, then `rename`, so
+/// that no reader ever sees partial content — Hyprland could reload the
+/// configuration mid-write.
 pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("création de {} impossible", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| {
+        t!("fs.create_dir_failed", path = dir.display().to_string()).to_string()
+    })?;
 
     let tmp = dir.join(format!(
-        ".{}.hyprmc.{}.{}.tmp",
+        ".{}.hyprdmc.{}.{}.tmp",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("out"),
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
 
     {
-        let mut file = std::fs::File::create(&tmp)
-            .with_context(|| format!("création de {} impossible", tmp.display()))?;
+        let mut file = std::fs::File::create(&tmp).with_context(|| {
+            t!("fs.create_dir_failed", path = tmp.display().to_string()).to_string()
+        })?;
         file.write_all(content.as_bytes())
-            .with_context(|| format!("écriture dans {} impossible", tmp.display()))?;
+            .with_context(|| t!("fs.write_failed", path = tmp.display().to_string()).to_string())?;
         file.sync_all().ok();
     }
 
     std::fs::rename(&tmp, path).with_context(|| {
         let _ = std::fs::remove_file(&tmp);
-        format!("remplacement de {} impossible", path.display())
+        t!("fs.rename_failed", path = path.display().to_string()).to_string()
     })
 }
 
-/// Rend le contenu de `monitors.conf` pour un agencement.
+/// Renders the contents of `monitors.conf` for a layout.
 pub fn render(layout: &Layout) -> String {
-    let mut out = String::from(HEADER);
+    let mut out = t!("emit.header").to_string();
     out.push('\n');
     for spec in layout.to_specs() {
         out.push_str("monitor = ");
@@ -62,13 +59,13 @@ pub fn render(layout: &Layout) -> String {
     out
 }
 
-/// Écrit l'agencement dans `monitors.conf`.
+/// Writes the layout to `monitors.conf`.
 pub fn persist(layout: &Layout, path: &Path) -> Result<()> {
     write_atomic(path, &render(layout))
 }
 
-/// Remplace le préfixe du répertoire personnel par `~`, comme on l'écrirait à
-/// la main dans `hyprland.conf`.
+/// Replaces the home directory prefix with `~`, the way one would write it
+/// by hand in `hyprland.conf`.
 pub fn tildify(path: &Path) -> String {
     let home = home();
     match path.strip_prefix(&home) {
@@ -77,23 +74,24 @@ pub fn tildify(path: &Path) -> String {
     }
 }
 
-/// Ce que `hyprmc init` a fait (ou ferait, en simulation).
+/// What `hyprdmc init` did (or would do, in a dry run).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InitReport {
-    /// `hyprland.conf` sourçait déjà le fichier généré.
+    /// `hyprland.conf` was already sourcing the generated file.
     pub already_wired: bool,
-    /// Copie de sauvegarde créée.
+    /// Backup copy created.
     pub backup: Option<PathBuf>,
-    /// Directives `monitor =` reprises depuis `hyprland.conf` puis commentées.
+    /// `monitor =` directives lifted from `hyprland.conf` and then
+    /// commented out.
     pub adopted: Vec<String>,
-    /// Nouveau contenu de `hyprland.conf`.
+    /// New contents of `hyprland.conf`.
     pub new_conf: String,
 }
 
-/// Calcule la transformation à appliquer à `hyprland.conf`.
+/// Computes the transformation to apply to `hyprland.conf`.
 ///
-/// Séparé de l'écriture pour pouvoir présenter le résultat à l'utilisateur
-/// avant de toucher à son fichier.
+/// Kept separate from the write so the result can be shown to the user
+/// before touching their file.
 pub fn plan_init(conf: &str, monitors_conf: &Path) -> InitReport {
     let source_line = format!("source = {}", tildify(monitors_conf));
     let target = monitors_conf
@@ -123,7 +121,10 @@ pub fn plan_init(conf: &str, monitors_conf: &Path) -> InitReport {
             if let Some(spec) = trimmed.split_once('=').map(|(_, v)| v.trim()) {
                 adopted.push(spec.to_string());
             }
-            lines.push(format!("# repris par hyprmc -> {target}\n#{line}"));
+            lines.push(format!(
+                "{}\n#{line}",
+                t!("emit.adopted_comment", target = target)
+            ));
             continue;
         }
         if !trimmed.starts_with('#') && is_directive(trimmed, "source") {
@@ -132,8 +133,8 @@ pub fn plan_init(conf: &str, monitors_conf: &Path) -> InitReport {
         lines.push(line.to_string());
     }
 
-    // Le `source` est inséré juste après les autres pour rester lisible ; à
-    // défaut, en tête de fichier.
+    // The `source` line is inserted right after the others to stay readable;
+    // otherwise, at the top of the file.
     let insert_at = last_source.map_or(0, |i| i + 1);
     lines.insert(insert_at, source_line);
 
@@ -150,25 +151,26 @@ pub fn plan_init(conf: &str, monitors_conf: &Path) -> InitReport {
     }
 }
 
-/// `mot = valeur` ou `mot=valeur`, en ignorant les espaces.
+/// `word = value` or `word=value`, ignoring whitespace.
 fn is_directive(line: &str, keyword: &str) -> bool {
     line.strip_prefix(keyword)
         .is_some_and(|rest| rest.trim_start().starts_with('='))
 }
 
-/// Branche `monitors.conf` dans `hyprland.conf`, avec sauvegarde préalable.
+/// Wires `monitors.conf` into `hyprland.conf`, with a prior backup.
 pub fn run_init(hyprland_conf: &Path, monitors_conf: &Path, dry_run: bool) -> Result<InitReport> {
-    let conf = std::fs::read_to_string(hyprland_conf)
-        .with_context(|| format!("lecture de {} impossible", hyprland_conf.display()))?;
+    let conf = std::fs::read_to_string(hyprland_conf).with_context(|| {
+        t!("fs.read_failed", path = hyprland_conf.display().to_string()).to_string()
+    })?;
     let mut report = plan_init(&conf, monitors_conf);
 
     if report.already_wired || dry_run {
         return Ok(report);
     }
 
-    let backup = hyprland_conf.with_extension("conf.hyprmc.bak");
+    let backup = hyprland_conf.with_extension("conf.hyprdmc.bak");
     std::fs::copy(hyprland_conf, &backup)
-        .with_context(|| format!("sauvegarde vers {} impossible", backup.display()))?;
+        .with_context(|| t!("fs.backup_failed", path = backup.display().to_string()).to_string())?;
     report.backup = Some(backup);
 
     write_atomic(hyprland_conf, &report.new_conf)?;
@@ -201,7 +203,7 @@ mod tests {
         b.transform = Transform::new(Rotation::R90, false);
         let layout = Layout::new(vec![out("eDP-1", 0, 0), b]);
         let text = render(&layout);
-        assert!(text.starts_with("# Généré par hyprmc"));
+        assert!(text.starts_with("# Generated by hyprdmc"));
         assert!(text.contains("monitor = eDP-1,1920x1080@60.00,0x0,1\n"));
         assert!(text.contains("monitor = DP-1,1920x1080@60.00,1920x0,1,transform,1\n"));
         assert_eq!(text.lines().filter(|l| l.starts_with("monitor")).count(), 2);
@@ -216,7 +218,7 @@ mod tests {
     }
 
     const SAMPLE: &str = "\
-# ma config
+# my config
 source = ~/.config/hypr/startup.conf
 source = ~/.config/hypr/env.conf
 
@@ -248,7 +250,7 @@ general {
                 .new_conf
                 .contains("#monitor = eDP-1,1920x1080@60,0x0,1")
         );
-        // Plus aucune directive monitor active.
+        // No more active `monitor` directive.
         assert!(
             !report
                 .new_conf
@@ -299,7 +301,7 @@ general {
 
     #[test]
     fn atomic_write_replaces_content_and_leaves_no_temp_file() {
-        let dir = std::env::temp_dir().join(format!("hyprmc-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hyprdmc-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("monitors.conf");
         write_atomic(&target, "premier").unwrap();

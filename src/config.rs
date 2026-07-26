@@ -1,30 +1,35 @@
-//! Profils utilisateur : lecture/écriture de `~/.config/hyprmc/config.toml` et
-//! sélection du profil correspondant au matériel branché.
+//! User profiles: reading/writing `~/.config/hyprdmc/config.toml` and
+//! selecting the profile that matches the connected hardware.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
 use crate::layout::{Layout, OutputState};
 use crate::monitor::{Mode, Monitor, Rotation, Transform};
 
-/// Réglages globaux du démon et du serveur web.
+/// Global settings for the daemon and the web server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Port d'écoute de l'interface web.
+    /// Listening port for the web interface.
     pub web_port: u16,
-    /// Adresse d'écoute. Locale par défaut : l'API pilote l'affichage, elle n'a
-    /// rien à faire sur le réseau sans décision explicite.
+    /// Listening address. Local by default: the API drives the display, it
+    /// has no business being on the network without an explicit decision.
     pub bind: String,
-    /// Appliquer automatiquement le profil correspondant au branchement.
+    /// Automatically apply the profile matching the current hardware.
     pub auto_apply: bool,
-    /// Délai avant retour arrière automatique si l'utilisateur ne confirme pas.
-    /// `0` désactive le filet de sécurité.
+    /// Delay before automatically reverting if the user does not confirm.
+    /// `0` disables the safety net.
     pub confirm_timeout_secs: u64,
-    /// Fichier généré, à sourcer depuis `hyprland.conf`.
+    /// Generated file, to be sourced from `hyprland.conf`.
     pub monitors_conf: PathBuf,
+    /// Interface language (`en`, `fr`). Unset means "follow the system
+    /// locale"; see [`crate::i18n`] for the full resolution order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 impl Default for Settings {
@@ -35,23 +40,24 @@ impl Default for Settings {
             auto_apply: true,
             confirm_timeout_secs: 10,
             monitors_conf: default_monitors_conf(),
+            language: None,
         }
     }
 }
 
-/// Règle décrivant comment configurer un écran donné.
+/// Rule describing how to configure a given output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputRule {
-    /// Motif désignant l'écran : nom de connecteur (`DP-1`), empreinte
-    /// (`Dell Inc. U2723QE ABC123`) ou motif avec `*`.
+    /// Pattern designating the output: connector name (`DP-1`), fingerprint
+    /// (`Dell Inc. U2723QE ABC123`), or a pattern with `*`.
     #[serde(rename = "match")]
     pub pattern: String,
     #[serde(default = "yes")]
     pub enabled: bool,
-    /// `None` = mode préféré de l'écran.
+    /// `None` = the output's preferred mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// `None` ou `"auto"` = position calculée automatiquement.
+    /// `None` or `"auto"` = position computed automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<String>,
     #[serde(default = "one")]
@@ -75,8 +81,8 @@ fn one() -> f64 {
 }
 
 impl OutputRule {
-    /// Construit une règle à partir d'un état concret, en désignant l'écran par
-    /// son empreinte pour que le profil survive à un changement de connecteur.
+    /// Builds a rule from a concrete state, identifying the output by its
+    /// fingerprint so the profile survives a connector change.
     pub fn from_state(state: &OutputState, monitor: Option<&Monitor>) -> Self {
         Self {
             pattern: monitor.map_or_else(|| state.name.clone(), Monitor::fingerprint),
@@ -91,7 +97,7 @@ impl OutputRule {
         }
     }
 
-    /// Cette règle désigne-t-elle cet écran ?
+    /// Does this rule designate this output?
     pub fn matches(&self, m: &Monitor) -> bool {
         m.identifiers()
             .iter()
@@ -120,34 +126,34 @@ impl OutputRule {
         })
     }
 
-    /// Position laissée au calcul automatique ?
+    /// Is the position left to automatic placement?
     fn auto_position(&self) -> bool {
         matches!(self.position.as_deref(), None | Some("") | Some("auto"))
     }
 }
 
-/// Analyse `"1920x0"` ou `"1920,0"`.
+/// Parses `"1920x0"` or `"1920,0"`.
 pub fn parse_position(s: &str) -> Result<(i32, i32)> {
     let s = s.trim();
     let (x, y) = s
         .split_once(['x', 'X', ','])
-        .ok_or_else(|| anyhow!("position invalide « {s} » (attendu XxY, par exemple 1920x0)"))?;
+        .ok_or_else(|| anyhow!(t!("config.invalid_position", value = s).to_string()))?;
     Ok((
         x.trim()
             .parse()
-            .map_err(|_| anyhow!("abscisse invalide dans « {s} »"))?,
+            .map_err(|_| anyhow!(t!("config.invalid_x", value = s).to_string()))?,
         y.trim()
             .parse()
-            .map_err(|_| anyhow!("ordonnée invalide dans « {s} »"))?,
+            .map_err(|_| anyhow!(t!("config.invalid_y", value = s).to_string()))?,
     ))
 }
 
-/// Un agencement nommé, associé à un ensemble d'écrans.
+/// A named layout, associated with a set of outputs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
-    /// Si vrai, le profil ne s'applique que si *tous* les écrans branchés sont
-    /// couverts par une règle.
+    /// If true, the profile only applies when *all* connected outputs are
+    /// covered by a rule.
     #[serde(default)]
     pub exact: bool,
     #[serde(default, rename = "output")]
@@ -155,12 +161,11 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Associe chaque règle à un écran branché.
+    /// Assigns each rule to a connected output.
     ///
-    /// Attribution gloutonne dans l'ordre de déclaration : une règle ne peut pas
-    /// voler l'écran déjà pris par une règle précédente. Retourne `None` dès
-    /// qu'une règle ne trouve pas preneur — le profil ne correspond alors pas au
-    /// matériel présent.
+    /// Greedy assignment in declaration order: a rule cannot steal an output
+    /// already claimed by an earlier rule. Returns `None` as soon as a rule
+    /// finds no taker — the profile then does not match the hardware present.
     pub fn assign<'a>(&self, monitors: &'a [Monitor]) -> Option<Vec<(&OutputRule, &'a Monitor)>> {
         let mut taken = vec![false; monitors.len()];
         let mut pairs = Vec::with_capacity(self.outputs.len());
@@ -182,16 +187,14 @@ impl Profile {
         !self.outputs.is_empty() && self.assign(monitors).is_some()
     }
 
-    /// Traduit le profil en agencement concret pour le matériel branché.
+    /// Translates the profile into a concrete layout for the connected
+    /// hardware.
     ///
-    /// Les écrans branchés qu'aucune règle ne couvre ne sont pas perdus : ils
-    /// sont ajoutés à droite de l'agencement avec leur mode préféré.
+    /// Connected outputs that no rule covers are not lost: they are appended
+    /// to the right of the layout with their preferred mode.
     pub fn resolve(&self, monitors: &[Monitor]) -> Result<Layout> {
         let pairs = self.assign(monitors).ok_or_else(|| {
-            anyhow!(
-                "le profil « {} » ne correspond pas aux écrans branchés",
-                self.name
-            )
+            anyhow!(t!("config.profile_mismatch", name = self.name.clone()).to_string())
         })?;
 
         let mut outputs = Vec::new();
@@ -228,7 +231,7 @@ impl Profile {
     }
 }
 
-/// Pose à droite de l'agencement les écrans dont la position est libre.
+/// Places, to the right of the layout, the outputs whose position is free.
 fn place_free_outputs(layout: &mut Layout, free: &[String]) {
     let mut cursor = layout
         .active()
@@ -249,7 +252,7 @@ fn place_free_outputs(layout: &mut Layout, free: &[String]) {
     }
 }
 
-/// Contenu complet de `config.toml`.
+/// Full contents of `config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -268,8 +271,9 @@ impl Config {
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("lecture de {} impossible", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("{} est mal formé", path.display()))
+            .with_context(|| t!("fs.read_failed", path = path.display().to_string()).to_string())?;
+        toml::from_str(&raw)
+            .with_context(|| t!("config.malformed", path = path.display().to_string()).to_string())
     }
 
     pub fn save(&self) -> Result<PathBuf> {
@@ -280,8 +284,9 @@ impl Config {
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("création de {} impossible", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| {
+                t!("fs.create_dir_failed", path = dir.display().to_string()).to_string()
+            })?;
         }
         let body = toml::to_string_pretty(self)?;
         crate::emit::write_atomic(path, &body)
@@ -291,7 +296,7 @@ impl Config {
         self.profiles.iter().find(|p| p.name == name)
     }
 
-    /// Remplace le profil de même nom, ou l'ajoute.
+    /// Replaces the profile with the same name, or appends it.
     pub fn upsert(&mut self, profile: Profile) {
         match self.profiles.iter_mut().find(|p| p.name == profile.name) {
             Some(existing) => *existing = profile,
@@ -303,16 +308,16 @@ impl Config {
         let before = self.profiles.len();
         self.profiles.retain(|p| p.name != name);
         if self.profiles.len() == before {
-            bail!("profil « {name} » inconnu");
+            bail!(t!("config.unknown_profile", name = name).to_string());
         }
         Ok(())
     }
 
-    /// Meilleur profil pour le matériel branché.
+    /// Best profile for the connected hardware.
     ///
-    /// Le profil couvrant le plus d'écrans gagne ; à égalité, le premier
-    /// déclaré. Un profil `exact` l'emporte sur un profil équivalent qui ne
-    /// l'est pas.
+    /// The profile covering the most outputs wins; ties go to the first one
+    /// declared. An `exact` profile beats an otherwise equivalent one that
+    /// is not.
     pub fn best_match(&self, monitors: &[Monitor]) -> Option<&Profile> {
         self.profiles
             .iter()
@@ -323,7 +328,7 @@ impl Config {
     }
 }
 
-/// Correspondance avec `*` comme joker, insensible à la casse.
+/// Matching with `*` as a wildcard, case-insensitive.
 fn glob_match(pattern: &str, value: &str) -> bool {
     let pattern = pattern.trim().to_lowercase();
     let value = value.trim().to_lowercase();
@@ -338,7 +343,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         }
         match value[pos..].find(part) {
             Some(found) => {
-                // Un motif ne commençant pas par `*` doit être ancré au début.
+                // A pattern that doesn't start with `*` must be anchored at the start.
                 if i == 0 && found != 0 {
                     return false;
                 }
@@ -347,7 +352,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
             None => return false,
         }
     }
-    // Un motif ne finissant pas par `*` doit être ancré à la fin.
+    // A pattern that doesn't end with `*` must be anchored at the end.
     if let Some(last) = parts.last()
         && !last.is_empty()
         && pos != value.len()
@@ -361,7 +366,7 @@ pub fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
-        .join("hyprmc")
+        .join("hyprdmc")
 }
 
 pub fn config_path() -> PathBuf {
@@ -434,14 +439,14 @@ mod tests {
     #[test]
     fn glob_matching_handles_anchors_and_wildcards() {
         assert!(glob_match("DP-1", "DP-1"));
-        assert!(glob_match("dp-1", "DP-1")); // insensible à la casse
+        assert!(glob_match("dp-1", "DP-1")); // case-insensitive
         assert!(!glob_match("DP-1", "DP-11"));
         assert!(glob_match("Dell*", "Dell Inc. U2723QE ABC"));
         assert!(!glob_match("Dell*", "Acer Dell"));
         assert!(glob_match("*U2723QE*", "Dell Inc. U2723QE ABC"));
         assert!(glob_match("*ABC", "Dell Inc. U2723QE ABC"));
         assert!(!glob_match("*ABC", "Dell Inc. U2723QE ABCD"));
-        assert!(glob_match("*", "n'importe quoi"));
+        assert!(glob_match("*", "anything"));
     }
 
     #[test]
@@ -568,7 +573,7 @@ mod tests {
         assert_eq!(layout.outputs.len(), 2);
         let extra = layout.get("DP-1").unwrap();
         assert!(extra.enabled);
-        // Posé à droite de l'écran déjà placé, sans chevauchement.
+        // Placed to the right of the already-positioned output, without overlap.
         assert_eq!(extra.x, 1920);
         assert!(!layout.has_errors());
     }
@@ -652,7 +657,7 @@ mod tests {
             }],
         };
         let err = p.resolve(&[monitor("DP-1", "Dell", "U", "")]).unwrap_err();
-        assert!(err.to_string().contains("rotation invalide"));
+        assert!(err.to_string().contains("invalid rotation"));
     }
 
     #[test]
@@ -677,13 +682,13 @@ mod tests {
         });
         assert_eq!(cfg.profiles.len(), 1);
         assert!(cfg.profiles[0].exact);
-        assert!(cfg.remove("inconnu").is_err());
+        assert!(cfg.remove("unknown").is_err());
         assert!(cfg.remove("a").is_ok());
     }
 
     #[test]
     fn missing_config_file_yields_defaults() {
-        let cfg = Config::load_from(Path::new("/inexistant/hyprmc/config.toml")).unwrap();
+        let cfg = Config::load_from(Path::new("/nonexistent/hyprdmc/config.toml")).unwrap();
         assert!(cfg.profiles.is_empty());
         assert_eq!(cfg.settings.web_port, 8787);
     }

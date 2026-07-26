@@ -1,229 +1,230 @@
-# hyprmc
+# hyprdmc
 
-**Gestion dynamique des écrans pour [Hyprland](https://hyprland.org/)** — CLI et interface web,
-dans un binaire unique.
+**Dynamic monitor configuration for [Hyprland](https://hyprland.org/)** — CLI and web UI,
+in a single binary.
 
-Hyprland ne gère pas le branchement à chaud des écrans : chaque changement de configuration
-(dock, projecteur, écran externe) suppose d'éditer `hyprland.conf` à la main puis de recharger.
-`hyprmc` détecte les écrans, les positionne, les tourne, les inverse — et surtout **réapplique
-tout seul le bon profil** quand le matériel change.
+Hyprland doesn't handle monitor hotplugging on its own: every configuration change (docking,
+projector, external display) means hand-editing `hyprland.conf` and reloading. `hyprdmc`
+detects monitors, positions them, rotates and flips them — and, most importantly, **reapplies
+the right profile on its own** whenever the hardware changes.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ Écran   État            Mode              Position   Échelle   Orientation   │
+│ Output   State              Mode              Position   Scale   Orientation │
 ╞══════════════════════════════════════════════════════════════════════════════╡
-│ eDP-1   actif (focus)   1920x1080@60.06   0x0        1         0°            │
-│ DP-3    actif           3840x2160@60.00   1920x0     1.5       90° inversé   │
+│ eDP-1    active (focused)   1920x1080@60.06   0x0        1       0°          │
+│ DP-3     active             3840x2160@60.00   1920x0     1.5     90° flipped │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Sommaire
+## Table of Contents
 
-- [Fonctionnalités](#fonctionnalités)
+- [Features](#features)
 - [Installation](#installation)
-- [Démarrage rapide](#démarrage-rapide)
-- [Interface web](#interface-web)
-- [Ligne de commande](#ligne-de-commande)
-- [Profils](#profils)
-- [Démon et branchement à chaud](#démon-et-branchement-à-chaud)
-- [Persistance](#persistance)
-- [Rotation et inversement](#rotation-et-inversement)
-- [Filet de sécurité](#filet-de-sécurité)
-- [API HTTP](#api-http)
+- [Quick Start](#quick-start)
+- [Web UI](#web-ui)
+- [Command Line](#command-line)
+- [Profiles](#profiles)
+- [Daemon and Hotplugging](#daemon-and-hotplugging)
+- [Persistence](#persistence)
+- [Rotation and Flipping](#rotation-and-flipping)
+- [Safety Net](#safety-net)
+- [HTTP API](#http-api)
 - [Configuration](#configuration)
-- [Développement](#développement)
-- [Fonctionnement interne](#fonctionnement-interne)
-- [Dépannage](#dépannage)
-- [Licence](#licence)
+- [Language](#language)
+- [Development](#development)
+- [Under the Hood](#under-the-hood)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
-## Fonctionnalités
+## Features
 
-- **Détection** — liste les écrans branchés, leurs modes, leur position, leur orientation.
-- **Positionnement** — au pixel près, par relations (`right-of`, `below`…), ou rangement
-  automatique.
-- **Rotation et inversement** — 0/90/180/270°, avec ou sans effet miroir.
-- **Duplication** — un écran peut recopier l'image d'un autre.
-- **Interface web** — canevas glisser-déposer avec aimantation, dans le navigateur.
-- **Profils** — un agencement par situation, identifié par les écrans branchés.
-- **Branchement à chaud** — un démon écoute Hyprland et applique le bon profil sans intervention.
-- **Filet de sécurité** — toute modification revient en arrière automatiquement sans confirmation.
-- **Persistance** — génère `monitors.conf` sans jamais réécrire votre `hyprland.conf`.
-- **Sans dépendance** — parle directement aux sockets de Hyprland, `hyprctl` n'est pas requis.
-  Aucun toolchain JavaScript : l'interface web est embarquée dans le binaire.
+- **Detection** — lists connected monitors, their modes, position, and orientation.
+- **Positioning** — pixel-precise, relative (`right-of`, `below`, …), or automatic arrangement.
+- **Rotation and flipping** — 0/90/180/270°, with or without a mirror effect.
+- **Mirroring** — one output can duplicate another's image.
+- **Web UI** — a drag-and-drop canvas with snapping, right in the browser.
+- **Profiles** — one layout per situation, identified by the monitors plugged in.
+- **Hotplugging** — a daemon watches Hyprland and applies the right profile automatically.
+- **Safety net** — any change is rolled back automatically if you don't confirm it.
+- **Persistence** — writes `monitors.conf` without ever touching your `hyprland.conf`.
+- **No dependencies** — talks directly to Hyprland's sockets, `hyprctl` isn't required.
+  No JavaScript toolchain either: the web UI is embedded in the binary.
 
 ## Installation
 
-### Depuis les sources
+### From source
 
 ```sh
-git clone https://github.com/jacquesh82/hyprmc.git
-cd hyprmc
+git clone https://github.com/jacquesh82/hyprdmc.git
+cd hyprdmc
 cargo build --release
-install -Dm755 target/release/hyprmc ~/.local/bin/hyprmc
+install -Dm755 target/release/hyprdmc ~/.local/bin/hyprdmc
 ```
 
-Rust 1.87 ou plus récent (édition 2024). Hyprland 0.40+ ; développé et testé sur 0.56.
+Rust 1.87 or newer (2024 edition). Hyprland 0.40+; developed and tested against 0.56.
 
-### Avec cargo
+### With cargo
 
 ```sh
 cargo install --path .
 ```
 
-## Démarrage rapide
+## Quick Start
 
 ```sh
-# 1. Que voit-on ?
-hyprmc list
+# 1. What's connected?
+hyprdmc list
 
-# 2. Arranger les écrans
-hyprmc arrange DP-1 right-of eDP-1
+# 2. Arrange the outputs
+hyprdmc arrange DP-1 right-of eDP-1
 
-# 3. Enregistrer la situation actuelle sous un nom
-hyprmc profile save bureau
+# 3. Save the current layout under a name
+hyprdmc profile save desk
 
-# 4. Brancher monitors.conf dans hyprland.conf (sauvegarde automatique)
-hyprmc init
+# 4. Wire monitors.conf into hyprland.conf (backs it up automatically)
+hyprdmc init
 
-# 5. Lancer le démon : hotplug + interface web sur http://127.0.0.1:8787
-hyprmc daemon
+# 5. Start the daemon: hotplug watcher + web UI on http://127.0.0.1:8787
+hyprdmc daemon
 ```
 
-## Interface web
+## Web UI
 
 ```sh
-hyprmc web            # interface seule
-hyprmc daemon         # interface + surveillance du branchement à chaud
+hyprdmc web            # UI only
+hyprdmc daemon         # UI + hotplug watcher
 ```
 
-Puis <http://127.0.0.1:8787>.
+Then open <http://127.0.0.1:8787>.
 
-- Glissez les écrans sur le canevas : ils **s'aimantent** aux bords voisins.
-- Flèches du clavier pour un réglage fin (`Maj` pour des pas de 100 px).
-- Panneau latéral : mode, échelle, rotation, inversement, duplication, VRR, activation.
-- Les chevauchements sont signalés en rouge et bloquent le bouton **Appliquer**.
-- Après application, un bandeau propose de **conserver** ou de **revenir en arrière** ;
-  sans réponse, la configuration précédente est restaurée automatiquement.
-- L'état se met à jour en temps réel (SSE) quand un écran est branché ou débranché.
+- Drag monitors on the canvas: they **snap** to neighboring edges.
+- Arrow keys for fine adjustment (`Shift` for 100 px steps).
+- Side panel: mode, scale, rotation, flip, mirroring, VRR, enable/disable.
+- Overlaps are flagged in red and block the **Apply** button.
+- After applying, a banner lets you **keep** the change or **revert** it; if you don't
+  answer, the previous configuration is restored automatically.
+- State updates live (SSE) whenever a monitor is plugged in or unplugged.
 
-L'écoute est limitée à `127.0.0.1` par défaut. Pour l'ouvrir à votre réseau local — en toute
-connaissance de cause, l'API n'a **aucune authentification** :
+Listening is restricted to `127.0.0.1` by default. To open it up to your local network —
+knowingly, since the API has **no authentication whatsoever**:
 
 ```sh
-hyprmc web --bind 0.0.0.0 --port 8787
+hyprdmc web --bind 0.0.0.0 --port 8787
 ```
 
-## Ligne de commande
+## Command Line
 
-### Lecture
+### Reading
 
 ```sh
-hyprmc list                  # tableau des écrans
-hyprmc list --json           # sortie brute
-hyprmc modes eDP-1           # modes disponibles
+hyprdmc list                  # table of monitors
+hyprdmc list --json           # raw output
+hyprdmc modes eDP-1           # available modes
 ```
 
-### Modification
+### Modifying
 
 ```sh
-hyprmc set DP-1 --mode 3840x2160@60 --scale 1.5
-hyprmc set DP-1 --rotate 90              # portrait
-hyprmc set DP-1 --rotate 90 --flip       # portrait, image inversée
-hyprmc set DP-1 --pos 1920x0
-hyprmc set DP-1 --mirror eDP-1           # duplique l'écran du portable
-hyprmc set DP-1 --no-mirror
-hyprmc set eDP-1 --disable               # portable fermé sur le dock
-hyprmc set DP-1 --vrr on
-hyprmc set DP-1 --rotate 270 --save bureau   # applique et enregistre dans le profil
+hyprdmc set DP-1 --mode 3840x2160@60 --scale 1.5
+hyprdmc set DP-1 --rotate 90              # portrait
+hyprdmc set DP-1 --rotate 90 --flip       # portrait, flipped image
+hyprdmc set DP-1 --pos 1920x0
+hyprdmc set DP-1 --mirror eDP-1           # duplicate the laptop's screen
+hyprdmc set DP-1 --no-mirror
+hyprdmc set eDP-1 --disable               # laptop lid closed on the dock
+hyprdmc set DP-1 --vrr on
+hyprdmc set DP-1 --rotate 270 --save desk     # apply and save into the profile
 ```
 
-### Positionnement relatif
+### Relative positioning
 
 ```sh
-hyprmc arrange DP-1 right-of eDP-1
-hyprmc arrange DP-1 above eDP-1 DP-2 right-of DP-1     # plusieurs triplets
-hyprmc auto                                            # rangement horizontal
+hyprdmc arrange DP-1 right-of eDP-1
+hyprdmc arrange DP-1 above eDP-1 DP-2 right-of DP-1     # multiple triples
+hyprdmc auto                                            # horizontal auto-arrange
 ```
 
-Relations : `left-of`, `right-of`, `above`, `below`, `same-as`
-(alias français : `gauche-de`, `droite-de`, `au-dessus-de`, `en-dessous-de`).
+Relations: `left-of`, `right-of`, `above`, `below`, `same-as`
+(also available in French: `gauche-de`, `droite-de`, `au-dessus-de`, `en-dessous-de`).
 
-### Options communes
+### Common options
 
-| Option | Effet |
+| Option | Effect |
 |---|---|
-| `--force` | applique malgré les avertissements et les écarts constatés |
-| `--no-confirm` | pas de demande de confirmation ni de retour arrière |
-| `-v`, `--verbose` | journalisation détaillée |
+| `--force` | apply despite warnings and detected mismatches |
+| `--no-confirm` | skip the confirmation prompt and automatic rollback |
+| `-v`, `--verbose` | verbose logging |
 
-## Profils
+## Profiles
 
-Un profil décrit un agencement et la manière de reconnaître les écrans auxquels il s'applique.
+A profile describes a layout and how to recognize the monitors it applies to.
 
 ```sh
-hyprmc profile save bureau          # enregistre l'agencement courant
-hyprmc profile save solo --exact    # ne s'applique que si aucun autre écran n'est branché
-hyprmc profile list
-hyprmc profile show bureau
-hyprmc profile apply bureau
-hyprmc profile rename bureau dock
-hyprmc profile delete dock
-hyprmc apply                        # applique le profil correspondant au matériel présent
+hyprdmc profile save desk            # save the current layout
+hyprdmc profile save solo --exact    # only applies when no other monitor is connected
+hyprdmc profile list
+hyprdmc profile show desk
+hyprdmc profile apply desk
+hyprdmc profile rename desk dock
+hyprdmc profile delete dock
+hyprdmc apply                        # apply the profile matching the connected hardware
 ```
 
-### Reconnaissance des écrans
+### Matching monitors
 
-Un écran est désigné par son **empreinte** — `fabricant modèle numéro-de-série` — et non par son
-connecteur : rebrancher le même écran sur un autre port ne casse pas le profil. Le nom du
-connecteur reste accepté, ainsi que les motifs avec `*` :
+A monitor is identified by its **fingerprint** — `make model serial-number` — rather than
+its connector: plugging the same monitor into a different port doesn't break the profile.
+The connector name still works too, as do glob patterns:
 
 ```toml
-match = "Dell Inc. U2723QE H7X2K93"    # empreinte complète, sans ambiguïté
-match = "Dell*"                        # n'importe quel Dell
-match = "eDP-1"                        # par connecteur
+match = "Dell Inc. U2723QE H7X2K93"    # full fingerprint, unambiguous
+match = "Dell*"                        # any Dell
+match = "eDP-1"                        # by connector
 ```
 
-### Choix du profil
+### Choosing a profile
 
-Parmi les profils dont **toutes** les règles trouvent un écran branché, `hyprmc` retient celui qui
-couvre le plus d'écrans. À égalité, un profil `exact` l'emporte, puis le premier déclaré.
+Among the profiles whose rules **all** match a connected monitor, `hyprdmc` picks the one
+covering the most monitors. Ties are broken in favor of an `exact` profile, then by
+declaration order.
 
-Un écran branché que le profil ne mentionne pas n'est pas perdu : il est activé dans son mode
-préféré et posé à droite de l'agencement.
+A connected monitor the profile doesn't mention isn't ignored: it's enabled at its preferred
+mode and placed to the right of the layout.
 
-Si aucun profil ne correspond, les écrans sont simplement rangés de gauche à droite.
+If no profile matches, monitors are simply arranged left to right.
 
-## Démon et branchement à chaud
+## Daemon and Hotplugging
 
 ```sh
-hyprmc daemon                    # hotplug + interface web
-hyprmc daemon --no-web           # hotplug seul
-hyprmc daemon --port 9000
+hyprdmc daemon                    # hotplug watcher + web UI
+hyprdmc daemon --no-web           # hotplug watcher only
+hyprdmc daemon --port 9000
 ```
 
-Le démon écoute le socket d'événements de Hyprland. À chaque branchement ou débranchement, il
-attend 500 ms que la situation se stabilise — un dock émet plusieurs événements d'affilée — puis
-sélectionne et applique le profil correspondant. Il se reconnecte tout seul si Hyprland redémarre.
+The daemon listens on Hyprland's event socket. On every connect or disconnect, it waits
+500 ms for things to settle — a dock fires several events in a row — then selects and
+applies the matching profile. It reconnects on its own if Hyprland restarts.
 
-### Démarrage automatique
+### Starting automatically
 
-Avec Hyprland, dans `hyprland.conf` :
+With Hyprland, in `hyprland.conf`:
 
 ```conf
-exec-once = hyprmc daemon
+exec-once = hyprdmc daemon
 ```
 
-Ou en service utilisateur systemd — `~/.config/systemd/user/hyprmc.service` :
+Or as a systemd user service — `~/.config/systemd/user/hyprdmc.service`:
 
 ```ini
 [Unit]
-Description=Gestion dynamique des écrans Hyprland
+Description=Dynamic monitor configuration for Hyprland
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/hyprmc daemon
+ExecStart=%h/.local/bin/hyprdmc daemon
 Restart=on-failure
 RestartSec=2
 
@@ -233,116 +234,118 @@ WantedBy=graphical-session.target
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now hyprmc.service
+systemctl --user enable --now hyprdmc.service
 ```
 
-## Persistance
+## Persistence
 
-`hyprmc` ne réécrit jamais votre `hyprland.conf`. Il gère son propre fichier,
-`~/.config/hypr/monitors.conf`, et l'y branche une seule fois :
+`hyprdmc` never rewrites your `hyprland.conf`. It manages its own file,
+`~/.config/hypr/monitors.conf`, and wires it in only once:
 
 ```sh
-hyprmc init --dry-run     # montre ce qui serait fait
-hyprmc init               # sauvegarde, puis modifie
+hyprdmc init --dry-run     # show what would be done
+hyprdmc init               # back up, then modify
 ```
 
-`init` est idempotent et :
+`init` is idempotent and:
 
-1. copie `hyprland.conf` en `hyprland.conf.hyprmc.bak` ;
-2. commente les directives `monitor =` existantes, en les reprenant dans `monitors.conf` ;
-3. insère `source = ~/.config/hypr/monitors.conf` après vos autres `source`.
+1. copies `hyprland.conf` to `hyprland.conf.hyprdmc.bak`;
+2. comments out existing `monitor =` directives, carrying them over into `monitors.conf`;
+3. inserts `source = ~/.config/hypr/monitors.conf` after your other `source` lines.
 
-Ensuite, `hyprmc persist` réécrit `monitors.conf` depuis l'état courant. Le fichier est écrit de
-façon atomique : Hyprland ne peut jamais en lire une version partielle.
+From then on, `hyprdmc persist` rewrites `monitors.conf` from the current state. The file is
+written atomically: Hyprland can never read a partial version of it.
 
 ```conf
-# Généré par hyprmc — NE PAS ÉDITER À LA MAIN.
+# Generated by hyprdmc — DO NOT EDIT BY HAND.
 monitor = eDP-1,1920x1080@60.06,0x0,1
 monitor = DP-3,3840x2160@60.00,1920x0,1.5,transform,5
 ```
 
-## Rotation et inversement
+## Rotation and Flipping
 
-Hyprland encode l'orientation dans un entier unique. `hyprmc` expose deux réglages indépendants et
-fait la conversion :
+Hyprland encodes orientation as a single integer. `hyprdmc` exposes two independent settings
+and handles the conversion:
 
 | `transform` | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
 |---|---|---|---|---|---|---|---|---|
 | **rotation** | 0° | 90° | 180° | 270° | 0° | 90° | 180° | 270° |
-| **inversé** | non | non | non | non | **oui** | **oui** | **oui** | **oui** |
+| **flipped** | no | no | no | no | **yes** | **yes** | **yes** | **yes** |
 
 ```sh
-hyprmc set DP-1 --rotate 90              # transform 1
-hyprmc set DP-1 --rotate 90 --flip       # transform 5
-hyprmc set DP-1 --rotate 0 --no-flip     # transform 0
+hyprdmc set DP-1 --rotate 90              # transform 1
+hyprdmc set DP-1 --rotate 90 --flip       # transform 5
+hyprdmc set DP-1 --rotate 0 --no-flip     # transform 0
 ```
 
-La rotation échange largeur et hauteur dans l'espace de travail : `hyprmc` en tient compte pour
-positionner les écrans et détecter les chevauchements.
+Rotation swaps width and height in the workspace's coordinate space: `hyprdmc` accounts for
+that when positioning monitors and detecting overlaps.
 
-## Filet de sécurité
+## Safety Net
 
-Une rotation malheureuse ou une position aberrante peut rendre un écran illisible. Trois garde-fous :
+A bad rotation or a stray position can leave a monitor unreadable. Three safeguards:
 
-1. **Validation avant envoi** — chevauchements, écrans inatteignables, échelles impossibles,
-   duplication d'un écran absent, extinction de tous les écrans. Les erreurs bloquent, les
-   avertissements informent. `--force` passe outre.
+1. **Pre-flight validation** — overlaps, unreachable monitors, impossible scales, mirroring
+   a monitor that isn't connected, turning off every monitor at once. Errors block the
+   change, warnings just inform. `--force` overrides them.
 
-2. **Vérification après envoi** — Hyprland répond `ok` même quand il n'obéit pas : un mode
-   inexistant est accepté en silence, une échelle invalide est arrondie sans le dire. `hyprmc`
-   relit l'état et compare. Si le résultat ne correspond pas, il revient immédiatement en arrière.
+2. **Post-apply verification** — Hyprland replies `ok` even when it didn't actually comply:
+   a nonexistent mode is silently accepted, an invalid scale gets rounded without saying so.
+   `hyprdmc` re-reads the state and compares it against what was requested. If it doesn't
+   match, it rolls back immediately.
 
-3. **Confirmation différée** — après une application réussie, vous avez 10 secondes pour confirmer.
-   Sans réponse, la configuration précédente est restaurée. Ne rien faire suffit à s'en sortir.
+3. **Delayed confirmation** — after a successful apply, you have 10 seconds to confirm it.
+   If you don't respond, the previous configuration is restored. Doing nothing is enough
+   to get back to safety.
 
 ```sh
-hyprmc set DP-1 --rotate 90
-# Conserver cette configuration ? [o/N] (retour arrière automatique dans 10 s)
+hyprdmc set DP-1 --rotate 90
+# Keep this configuration? [y/N] (auto-revert in 10 s)
 ```
 
-Le délai se règle par `confirm_timeout_secs` ; `0` désactive le mécanisme, `--no-confirm` le
-contourne ponctuellement.
+The delay is controlled by `confirm_timeout_secs`; `0` disables the mechanism, `--no-confirm`
+bypasses it for a single command.
 
-## API HTTP
+## HTTP API
 
-| Méthode | Route | Rôle |
+| Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/api/state` | état complet : écrans, agencement, anomalies, profils |
-| `GET` | `/api/monitors` | écrans bruts tels que rapportés par Hyprland |
-| `POST` | `/api/apply` | applique un agencement (`{outputs, force, guard}`) |
-| `POST` | `/api/confirm` | confirme la dernière application |
-| `POST` | `/api/revert` | revient immédiatement en arrière |
-| `POST` | `/api/persist` | écrit `monitors.conf` |
-| `GET` | `/api/profiles` | liste des profils et profil actif |
-| `PUT` | `/api/profiles/{nom}` | enregistre un profil |
-| `DELETE` | `/api/profiles/{nom}` | supprime un profil |
-| `POST` | `/api/profiles/{nom}/apply` | applique un profil |
-| `GET` | `/api/events` | flux SSE poussant l'état à chaque changement |
+| `GET` | `/api/state` | full state: monitors, layout, issues, profiles |
+| `GET` | `/api/monitors` | raw monitors as reported by Hyprland |
+| `POST` | `/api/apply` | apply a layout (`{outputs, force, guard}`) |
+| `POST` | `/api/confirm` | confirm the last apply |
+| `POST` | `/api/revert` | roll back immediately |
+| `POST` | `/api/persist` | write `monitors.conf` |
+| `GET` | `/api/profiles` | list of profiles and the active one |
+| `PUT` | `/api/profiles/{name}` | save a profile |
+| `DELETE` | `/api/profiles/{name}` | delete a profile |
+| `POST` | `/api/profiles/{name}/apply` | apply a profile |
+| `GET` | `/api/events` | SSE stream pushing state on every change |
 
 ```sh
 curl -s localhost:8787/api/state | jq '.monitors[].name'
-curl -X POST localhost:8787/api/profiles/bureau/apply
+curl -X POST localhost:8787/api/profiles/desk/apply
 ```
 
 ## Configuration
 
-`~/.config/hyprmc/config.toml` (créé au premier `profile save`) :
+`~/.config/hyprdmc/config.toml` (created on the first `profile save`):
 
 ```toml
 [settings]
 web_port = 8787
 bind = "127.0.0.1"
-auto_apply = true               # le démon applique le profil au branchement
-confirm_timeout_secs = 10       # 0 = pas de retour arrière automatique
-monitors_conf = "/home/vous/.config/hypr/monitors.conf"
+auto_apply = true               # the daemon applies the matching profile on hotplug
+confirm_timeout_secs = 10       # 0 = no automatic rollback
+monitors_conf = "/home/you/.config/hypr/monitors.conf"
 
 [[profile]]
-name = "bureau"
+name = "desk"
 exact = false
 
 [[profile.output]]
-match = "AU Optronics 0x5799"   # dalle du portable
-enabled = false                 # capot fermé sur le dock
+match = "AU Optronics 0x5799"   # laptop panel
+enabled = false                 # lid closed on the dock
 
 [[profile.output]]
 match = "Dell Inc. U2723QE H7X2K93"
@@ -354,83 +357,100 @@ flipped = false
 vrr = true
 ```
 
-Champs d'une règle : `match` (obligatoire), `enabled`, `mode`, `position`, `scale`, `rotation`,
-`flipped`, `mirror_of`, `vrr`. `mode` et `position` acceptent `"auto"` pour laisser `hyprmc`
-choisir.
+Fields of a rule: `match` (required), `enabled`, `mode`, `position`, `scale`, `rotation`,
+`flipped`, `mirror_of`, `vrr`. `mode` and `position` accept `"auto"` to let `hyprdmc` decide.
 
-Journalisation : `HYPRMC_LOG=hyprmc=debug hyprmc daemon`.
+Logging: `HYPRDMC_LOG=hyprdmc=debug hyprdmc daemon`.
 
-## Développement
+## Language
+
+`hyprdmc` ships with English and French translations. It picks a language in this order:
+
+1. the `HYPRDMC_LANG` environment variable, if set;
+2. otherwise the `language` key in `config.toml`;
+3. otherwise the usual `LC_ALL` / `LC_MESSAGES` / `LANG` locale variables;
+4. and English if none of the above resolve to a supported language.
+
+This affects runtime messages: CLI feedback, validation warnings and the web UI. `--help`
+output and log lines are always in English, regardless of the resolved language — the former
+because clap needs its help text at compile time, the latter so that a pasted log stays
+readable in a bug report.
+
+Adding a new language just means adding a section to `locales/app.yml` and registering its
+code in the `AVAILABLE` list in `src/i18n.rs` — contributions welcome.
+
+## Development
 
 ```sh
-cargo test              # 99 tests, sans Hyprland requis
+cargo test              # the full test suite runs without a compositor
 cargo clippy --all-targets
 cargo fmt
 ```
 
-La logique métier ne dépend que du trait `HyprBackend`, ce qui permet de tout tester avec un
-backend simulé — y compris la latence d'application du compositeur.
+The business logic only depends on the `HyprBackend` trait, which makes it possible to test
+everything against a simulated backend — including the compositor's apply latency.
 
-### Tester le multi-écrans sans matériel
+### Testing multi-monitor setups without hardware
 
-Hyprland sait créer des sorties virtuelles :
+Hyprland can create virtual outputs:
 
 ```sh
 hyprctl output create headless test-1
-hyprmc list
-hyprmc set test-1 --rotate 90 --no-confirm
+hyprdmc list
+hyprdmc set test-1 --rotate 90 --no-confirm
 hyprctl output remove test-1
 ```
 
-Pour ne pas toucher à votre vraie configuration pendant les essais :
+To avoid touching your real configuration while experimenting:
 
 ```sh
-XDG_CONFIG_HOME=/tmp/essai hyprmc profile save brouillon
+XDG_CONFIG_HOME=/tmp/scratch hyprdmc profile save draft
 ```
 
-## Fonctionnement interne
+## Under the Hood
 
 ```
 src/
-  ipc.rs       sockets Hyprland : requêtes (.socket.sock) et événements (.socket2.sock)
-  monitor.rs   modèle d'un écran, rotation, modes, empreinte
-  layout.rs    agencement, tailles logiques, validation, arrangement
-  apply.rs     envoi en lot, vérification, retour arrière
-  config.rs    profils TOML, correspondance avec le matériel
-  emit.rs      génération de monitors.conf, branchement dans hyprland.conf
-  daemon.rs    boucle d'événements, anti-rebond, état partagé
-  web/         API axum, flux SSE, interface embarquée
+  ipc.rs       Hyprland sockets: requests (.socket.sock) and events (.socket2.sock)
+  monitor.rs   monitor model, rotation, modes, fingerprint
+  layout.rs    layout, logical sizes, validation, arrangement
+  apply.rs     batch sending, verification, rollback
+  config.rs    TOML profiles, matching against hardware
+  emit.rs      monitors.conf generation, wiring into hyprland.conf
+  daemon.rs    event loop, debouncing, shared state
+  web/         axum API, SSE stream, embedded UI
 ```
 
-Trois comportements de Hyprland ont façonné la conception, tous vérifiés sur la version 0.56 :
+Three Hyprland quirks shaped this design, all verified against version 0.56:
 
-- **`ok` ne veut pas dire « fait »** — un mode inexistant, une position aberrante ou une échelle
-  invalide sont acceptés sans erreur. D'où la relecture systématique de l'état.
-- **L'application est asynchrone** — une rotation met une cinquantaine de millisecondes à se
-  refléter dans `j/monitors`. `hyprmc` relit jusqu'à convergence plutôt qu'une seule fois, sans
-  attendre inutilement sur les corrections que le compositeur ne reprendra jamais.
-- **`mirrorOf` contient un identifiant, pas un nom** — Hyprland publie `"0"` là où la
-  configuration attend `eDP-1`. La résolution est faite à la lecture.
+- **`ok` doesn't mean "done"** — a nonexistent mode, a nonsensical position, or an invalid
+  scale are all accepted without error. Hence the systematic re-reading of state after
+  every change.
+- **Applying a change is asynchronous** — a rotation takes roughly 50 ms to show up in
+  `j/monitors`. `hyprdmc` polls until the state converges rather than checking just once,
+  without wasting time waiting on corrections the compositor will never make.
+- **`mirrorOf` reports a numeric id, not a name** — Hyprland publishes `"0"` where the
+  configuration expects `eDP-1`. The id is resolved back to a connector name on read.
 
-## Dépannage
+## Troubleshooting
 
-**« Hyprland ne semble pas accessible »**
-`HYPRLAND_INSTANCE_SIGNATURE` n'est pas défini (service systemd lancé trop tôt, session
-distante…). Le démon retrouve l'instance tout seul s'il n'y en a qu'une ; sinon, exportez la
-variable.
+**"Hyprland doesn't seem to be reachable"**
+`HYPRLAND_INSTANCE_SIGNATURE` isn't set (a systemd service started too early, a remote
+session, …). The daemon finds the running instance on its own if there's only one;
+otherwise, export the variable yourself.
 
-**Mon échelle est modifiée toute seule**
-Hyprland n'accepte que les échelles donnant une taille logique entière. `hyprmc` prévient avant
-l'envoi et suggère la valeur valide la plus proche.
+**My scale keeps getting changed**
+Hyprland only accepts scales that produce an integer logical size. `hyprdmc` warns before
+sending the change and suggests the nearest valid value.
 
-**Le profil ne s'applique pas au branchement**
-Vérifiez que le démon tourne (`systemctl --user status hyprmc`), que `auto_apply` est à `true`,
-et que le profil correspond : `hyprmc profile list` indique quels profils sont compatibles avec le
-matériel présent.
+**The profile doesn't apply on hotplug**
+Check that the daemon is running (`systemctl --user status hyprdmc`), that `auto_apply` is
+`true`, and that the profile actually matches: `hyprdmc profile list` shows which profiles
+are compatible with the currently connected hardware.
 
-**Mes réglages disparaissent au redémarrage de Hyprland**
-Lancez `hyprmc init` puis `hyprmc persist` : sans cela, les modifications ne vivent qu'en mémoire.
+**My settings disappear when Hyprland restarts**
+Run `hyprdmc init` then `hyprdmc persist`: without that, changes only ever live in memory.
 
-## Licence
+## License
 
-MIT — voir [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

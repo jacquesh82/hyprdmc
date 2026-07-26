@@ -1,35 +1,36 @@
-//! Application d'un agencement avec filet de sécurité.
+//! Applying a layout with a safety net.
 //!
-//! Hyprland répond `ok` même quand il n'a pas fait ce qu'on lui demandait : un
-//! mode inexistant est accepté sans broncher, une échelle invalide est arrondie
-//! en silence. La seule façon fiable de savoir ce qui s'est passé est de relire
-//! l'état ensuite et de le comparer à ce qu'on voulait — c'est le rôle de
-//! [`diff`].
+//! Hyprland replies `ok` even when it hasn't done what was asked: a
+//! nonexistent mode is accepted without complaint, an invalid scale is
+//! silently rounded. The only reliable way to know what actually happened is
+//! to re-read the state afterwards and compare it to what was wanted — that's
+//! the role of [`diff`].
 //!
-//! Mais le changement n'est pas instantané : une rotation met une cinquantaine
-//! de millisecondes à se refléter dans `j/monitors`. Relire une seule fois,
-//! juste après le `ok`, ferait conclure à tort à un échec — d'où la phase de
-//! stabilisation de [`observe`].
+//! But the change isn't instantaneous: a rotation takes roughly fifty
+//! milliseconds to be reflected in `j/monitors`. Reading it only once, right
+//! after the `ok`, would wrongly conclude failure — hence the settling phase
+//! in [`observe`].
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
 use crate::ipc::HyprBackend;
 use crate::layout::{Issue, Layout, Severity, format_scale};
 use crate::monitor::Monitor;
 
-/// Écart toléré sur l'échelle avant de le signaler.
+/// Tolerance on the scale before reporting a drift.
 const SCALE_TOLERANCE: f64 = 0.005;
-/// Écart toléré sur le taux de rafraîchissement (Hyprland arrondit : 60 → 60.06).
+/// Tolerance on the refresh rate (Hyprland rounds: 60 → 60.06).
 const REFRESH_TOLERANCE: f64 = 1.5;
-/// Intervalle entre deux relectures pendant la stabilisation.
+/// Interval between two reads while settling.
 const SETTLE_INTERVAL: Duration = Duration::from_millis(50);
-/// Au-delà, on considère que Hyprland ne fera plus rien.
+/// Beyond this, we consider that Hyprland won't do anything more.
 const SETTLE_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Propriété sur laquelle porte un écart.
+/// Property a drift is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Field {
@@ -44,18 +45,18 @@ pub enum Field {
 }
 
 impl Field {
-    /// Cet écart peut-il se résorber tout seul si l'on patiente ?
+    /// Can this drift resolve itself if we wait?
     ///
-    /// Oui pour tout ce que Hyprland applique au commit suivant. Non pour
-    /// l'échelle et le rafraîchissement : ce sont des corrections délibérées du
-    /// compositeur, attendre ne changerait rien et ferait perdre 1,5 s à chaque
+    /// Yes for everything Hyprland applies on the next commit. No for scale
+    /// and refresh rate: those are deliberate corrections made by the
+    /// compositor, waiting would change nothing and would waste 1.5s on every
     /// application.
     fn converges(self) -> bool {
         !matches!(self, Field::Scale | Field::Refresh)
     }
 }
 
-/// Un écart entre ce qui a été demandé et ce que Hyprland a réellement fait.
+/// A drift between what was requested and what Hyprland actually did.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Drift {
     pub output: String,
@@ -84,16 +85,16 @@ impl Drift {
     }
 }
 
-/// Résultat d'une application.
+/// Result of an apply operation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ApplyReport {
-    /// Directives envoyées à Hyprland.
+    /// Directives sent to Hyprland.
     pub specs: Vec<String>,
-    /// Problèmes détectés avant envoi.
+    /// Problems detected before sending.
     pub issues: Vec<Issue>,
-    /// Écarts constatés après envoi.
+    /// Drifts observed after sending.
     pub drifts: Vec<Drift>,
-    /// L'état précédent a été restauré.
+    /// The previous state has been restored.
     pub rolled_back: bool,
 }
 
@@ -103,7 +104,7 @@ impl ApplyReport {
     }
 }
 
-/// Compare l'agencement demandé à l'état réellement obtenu.
+/// Compares the requested layout to the state actually obtained.
 pub fn diff(requested: &Layout, actual: &[Monitor]) -> Vec<Drift> {
     let mut drifts = Vec::new();
 
@@ -112,29 +113,32 @@ pub fn diff(requested: &Layout, actual: &[Monitor]) -> Vec<Drift> {
             drifts.push(Drift::error(
                 &want.name,
                 Field::Presence,
-                format!("« {} » a disparu de la liste des écrans", want.name),
+                t!("apply.drift.vanished", name = &want.name).to_string(),
             ));
             continue;
         };
 
         if want.enabled == got.disabled {
+            let wanted_state = if want.enabled {
+                t!("apply.state.enabled")
+            } else {
+                t!("apply.state.disabled")
+            };
+            let got_state = if got.disabled {
+                t!("apply.state.disabled")
+            } else {
+                t!("apply.state.enabled")
+            };
             drifts.push(Drift::error(
                 &want.name,
                 Field::Enabled,
-                format!(
-                    "« {} » devrait être {} mais est {}",
-                    want.name,
-                    if want.enabled {
-                        "activé"
-                    } else {
-                        "désactivé"
-                    },
-                    if got.disabled {
-                        "désactivé"
-                    } else {
-                        "activé"
-                    }
-                ),
+                t!(
+                    "apply.drift.enabled_mismatch",
+                    name = &want.name,
+                    wanted = wanted_state,
+                    got = got_state
+                )
+                .to_string(),
             ));
             continue;
         }
@@ -148,10 +152,13 @@ pub fn diff(requested: &Layout, actual: &[Monitor]) -> Vec<Drift> {
                 drifts.push(Drift::error(
                     &want.name,
                     Field::Mode,
-                    format!(
-                        "mode refusé pour « {} » : {}x{} demandé, {}x{} obtenu",
-                        want.name, mode.width, mode.height, got.width, got.height
-                    ),
+                    t!(
+                        "apply.drift.mode_refused",
+                        name = &want.name,
+                        wanted = format!("{}x{}", mode.width, mode.height),
+                        got = format!("{}x{}", got.width, got.height)
+                    )
+                    .to_string(),
                 ));
             } else if mode.refresh > 0.0
                 && (mode.refresh - got.refresh_rate).abs() > REFRESH_TOLERANCE
@@ -159,24 +166,30 @@ pub fn diff(requested: &Layout, actual: &[Monitor]) -> Vec<Drift> {
                 drifts.push(Drift::warning(
                     &want.name,
                     Field::Refresh,
-                    format!(
-                        "taux de rafraîchissement ajusté sur « {} » : {:.2} Hz demandé, {:.2} Hz obtenu",
-                        want.name, mode.refresh, got.refresh_rate
-                    ),
+                    t!(
+                        "apply.drift.refresh_adjusted",
+                        name = &want.name,
+                        wanted = format!("{:.2}", mode.refresh),
+                        got = format!("{:.2}", got.refresh_rate)
+                    )
+                    .to_string(),
                 ));
             }
         }
 
-        // Un écran dupliqué se cale sur la position de sa source : comparer sa
-        // position à celle demandée n'aurait aucun sens.
+        // A mirrored output snaps to its source's position: comparing its
+        // position to the requested one wouldn't make sense.
         if want.mirror_of.is_none() && (want.x != got.x || want.y != got.y) {
             drifts.push(Drift::error(
                 &want.name,
                 Field::Position,
-                format!(
-                    "position refusée pour « {} » : {}x{} demandé, {}x{} obtenu",
-                    want.name, want.x, want.y, got.x, got.y
-                ),
+                t!(
+                    "apply.drift.position_refused",
+                    name = &want.name,
+                    wanted = format!("{}x{}", want.x, want.y),
+                    got = format!("{}x{}", got.x, got.y)
+                )
+                .to_string(),
             ));
         }
 
@@ -184,41 +197,45 @@ pub fn diff(requested: &Layout, actual: &[Monitor]) -> Vec<Drift> {
             drifts.push(Drift::error(
                 &want.name,
                 Field::Transform,
-                format!(
-                    "orientation refusée pour « {} » : {} demandé, {} obtenu",
-                    want.name,
-                    want.transform,
-                    got.transform()
-                ),
+                t!(
+                    "apply.drift.transform_refused",
+                    name = &want.name,
+                    wanted = want.transform,
+                    got = got.transform()
+                )
+                .to_string(),
             ));
         }
 
-        // Hyprland arrondit l'échelle à une valeur qui donne une taille logique
-        // entière : c'est une correction attendue, pas un échec.
+        // Hyprland rounds the scale to a value that yields an integral
+        // logical size: this is an expected correction, not a failure.
         if (want.scale - got.scale).abs() > SCALE_TOLERANCE {
             drifts.push(Drift::warning(
                 &want.name,
                 Field::Scale,
-                format!(
-                    "échelle ajustée par Hyprland sur « {} » : {} demandé, {} appliqué",
-                    want.name,
-                    format_scale(want.scale),
-                    format_scale(got.scale)
-                ),
+                t!(
+                    "apply.drift.scale_adjusted",
+                    name = &want.name,
+                    wanted = format_scale(want.scale),
+                    got = format_scale(got.scale)
+                )
+                .to_string(),
             ));
         }
 
         let got_mirror = got.mirror_target(actual);
         if want.mirror_of != got_mirror {
+            let none = t!("apply.mirror.none");
             drifts.push(Drift::warning(
                 &want.name,
                 Field::Mirror,
-                format!(
-                    "duplication non conforme sur « {} » : {} demandé, {} obtenu",
-                    want.name,
-                    want.mirror_of.as_deref().unwrap_or("aucune"),
-                    got_mirror.as_deref().unwrap_or("aucune")
-                ),
+                t!(
+                    "apply.drift.mirror_mismatch",
+                    name = &want.name,
+                    wanted = want.mirror_of.as_deref().unwrap_or(&none),
+                    got = got_mirror.as_deref().unwrap_or(&none)
+                )
+                .to_string(),
             ));
         }
     }
@@ -226,18 +243,17 @@ pub fn diff(requested: &Layout, actual: &[Monitor]) -> Vec<Drift> {
     drifts
 }
 
-/// Lit l'état courant sous forme d'agencement, pour pouvoir y revenir.
+/// Reads the current state as a layout, so we can go back to it.
 pub fn snapshot(backend: &dyn HyprBackend) -> Result<Layout> {
     Ok(Layout::from_monitors(&backend.monitors()?))
 }
 
-/// Relit l'état jusqu'à ce qu'il corresponde à la demande, ou jusqu'à
-/// expiration.
+/// Re-reads the state until it matches the request, or until timeout.
 ///
-/// Hyprland accuse réception immédiatement mais applique au commit suivant :
-/// une rotation n'est visible dans `j/monitors` qu'une cinquantaine de
-/// millisecondes plus tard. On sort dès que plus aucun écart bloquant ne
-/// subsiste, donc sans attente inutile dans le cas courant.
+/// Hyprland acknowledges immediately but applies on the next commit: a
+/// rotation isn't visible in `j/monitors` until roughly fifty milliseconds
+/// later. We return as soon as no more blocking drift remains, so there's no
+/// needless waiting in the common case.
 pub fn observe(backend: &dyn HyprBackend, layout: &Layout) -> Result<Vec<Drift>> {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
@@ -250,11 +266,11 @@ pub fn observe(backend: &dyn HyprBackend, layout: &Layout) -> Result<Vec<Drift>>
     }
 }
 
-/// Envoie l'agencement à Hyprland, vérifie le résultat, et revient en arrière
-/// si le résultat est inutilisable.
+/// Sends the layout to Hyprland, checks the result, and rolls back if the
+/// result is unusable.
 ///
-/// `force` passe outre les erreurs de validation *et* les écarts constatés :
-/// c'est la sortie de secours quand l'utilisateur sait ce qu'il fait.
+/// `force` bypasses validation errors *and* observed drifts: it's the escape
+/// hatch for when the user knows what they're doing.
 pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<ApplyReport> {
     let issues = layout.validate();
     let blocking: Vec<&Issue> = issues
@@ -263,12 +279,15 @@ pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<
         .collect();
     if !blocking.is_empty() && !force {
         bail!(
-            "agencement refusé :\n{}\n(utilisez --force pour passer outre)",
-            blocking
-                .iter()
-                .map(|i| format!("  • {}", i.message))
-                .collect::<Vec<_>>()
-                .join("\n")
+            t!(
+                "apply.rejected",
+                issues = blocking
+                    .iter()
+                    .map(|i| format!("  • {}", i.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+            .to_string()
         );
     }
 
@@ -282,7 +301,7 @@ pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<
     };
 
     if let Err(err) = backend.set_monitors(&specs) {
-        // Un batch peut avoir été partiellement appliqué : on remet l'état connu.
+        // A batch may have been partially applied: restore the last known-good state.
         restore(backend, &previous).ok();
         return Err(err);
     }
@@ -298,18 +317,18 @@ pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<
     Ok(report)
 }
 
-/// Réapplique un agencement connu, sans validation ni vérification : on revient
-/// à un état qui fonctionnait, il ne faut surtout pas que ça échoue.
+/// Reapplies a known layout, without validation or verification: we're going
+/// back to a state that worked, and this must not fail.
 pub fn restore(backend: &dyn HyprBackend, layout: &Layout) -> Result<()> {
     backend.set_monitors(&layout.to_specs())
 }
 
-/// Demande confirmation à l'utilisateur et restaure l'état précédent en
-/// l'absence de réponse.
+/// Asks the user for confirmation and restores the previous state if there
+/// is no answer.
 ///
-/// C'est le garde-fou classique des réglages d'affichage : si la nouvelle
-/// configuration rend l'écran illisible, ne rien faire suffit à revenir en
-/// arrière.
+/// This is the classic safety net for display settings: if the new
+/// configuration makes the screen unreadable, doing nothing is enough to
+/// revert.
 pub fn confirm_or_revert(
     backend: &dyn HyprBackend,
     previous: &Layout,
@@ -322,13 +341,16 @@ pub fn confirm_or_revert(
         return Ok(true);
     }
     if !stdin_is_tty() {
-        // Sans terminal (script, hook), personne ne peut confirmer : on garde.
+        // Without a terminal (script, hook), no one can confirm: we keep it.
         return Ok(true);
     }
 
     print!(
-        "Conserver cette configuration ? [o/N] (retour arrière automatique dans {} s) ",
-        timeout.as_secs()
+        "{}",
+        t!(
+            "apply.confirm_prompt",
+            seconds = timeout.as_secs().to_string()
+        )
     );
     std::io::stdout().flush().ok();
 
@@ -371,7 +393,7 @@ mod tests {
     use crate::layout::OutputState;
     use crate::monitor::{Mode, Rotation, Transform};
 
-    /// `(nom, largeur, hauteur, x, y, échelle, transform, désactivé)`
+    /// `(name, width, height, x, y, scale, transform, disabled)`
     type Row<'a> = (&'a str, i32, i32, i32, i32, f64, u8, bool);
 
     fn monitors_json(entries: &[Row<'_>]) -> String {
@@ -414,7 +436,7 @@ mod tests {
 
     #[test]
     fn diff_catches_a_silently_refused_mode() {
-        // Hyprland répond « ok » pour un mode inexistant : seul le relevé le révèle.
+        // Hyprland replies "ok" for a nonexistent mode: only a fresh read reveals it.
         let layout = Layout::new(vec![want("DP-1", 9999, 9999, 0, 0)]);
         let actual: Vec<Monitor> =
             serde_json::from_str(&monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]))
@@ -422,7 +444,7 @@ mod tests {
         let drifts = diff(&layout, &actual);
         assert_eq!(drifts.len(), 1);
         assert_eq!(drifts[0].severity, Severity::Error);
-        assert!(drifts[0].message.contains("mode refusé"));
+        assert!(drifts[0].message.contains("mode refused"));
     }
 
     #[test]
@@ -440,7 +462,7 @@ mod tests {
 
     #[test]
     fn adjusted_scale_is_only_a_warning() {
-        // Cas réel : 1.37 demandé, 1.33 appliqué.
+        // Real-world case: 1.37 requested, 1.33 applied.
         let mut w = want("DP-1", 1920, 1080, 0, 0);
         w.scale = 1.37;
         let layout = Layout::new(vec![w]);
@@ -455,7 +477,7 @@ mod tests {
 
     #[test]
     fn refresh_rounding_is_tolerated() {
-        // 60 demandé, 60.056 appliqué : c'est le même mode.
+        // 60 requested, 60.056 applied: it's the same mode.
         let layout = Layout::new(vec![want("eDP-1", 1920, 1080, 0, 0)]);
         let json = monitors_json(&[("eDP-1", 1920, 1080, 0, 0, 1.0, 0, false)])
             .replace("\"refreshRate\":60.0", "\"refreshRate\":60.056");
@@ -468,7 +490,7 @@ mod tests {
         let layout = Layout::new(vec![want("DP-1", 1920, 1080, 0, 0)]);
         let drifts = diff(&layout, &[]);
         assert_eq!(drifts[0].severity, Severity::Error);
-        assert!(drifts[0].message.contains("disparu"));
+        assert!(drifts[0].message.contains("disappeared"));
     }
 
     #[test]
@@ -481,7 +503,7 @@ mod tests {
                 .unwrap();
         let drifts = diff(&layout, &actual);
         assert_eq!(drifts[0].severity, Severity::Error);
-        assert!(drifts[0].message.contains("désactivé"));
+        assert!(drifts[0].message.contains("disabled"));
     }
 
     #[test]
@@ -505,7 +527,7 @@ mod tests {
             .into_iter()
             .filter(|c| c.starts_with("[[BATCH]]"))
             .collect();
-        assert_eq!(batches.len(), 1, "un seul aller-retour attendu");
+        assert_eq!(batches.len(), 1, "expected a single round trip");
         assert!(batches[0].contains("keyword monitor eDP-1,1920x1080@60.00,0x0,1"));
         assert!(batches[0].contains("keyword monitor DP-1,1920x1080@60.00,1920x0,1"));
     }
@@ -514,26 +536,26 @@ mod tests {
     fn apply_refuses_an_invalid_layout_without_touching_hyprland() {
         let json = monitors_json(&[("A", 1920, 1080, 0, 0, 1.0, 0, false)]);
         let backend = FakeBackend::with_monitors(&json);
-        // Deux écrans superposés : erreur de validation.
+        // Two overlapping outputs: validation error.
         let layout = Layout::new(vec![
             want("A", 1920, 1080, 0, 0),
             want("B", 1920, 1080, 100, 0),
         ]);
         let err = apply(&backend, &layout, false).unwrap_err();
-        assert!(err.to_string().contains("chevauchent"));
+        assert!(err.to_string().contains("overlap"));
         assert!(
             !backend
                 .sent_commands()
                 .iter()
                 .any(|c| c.contains("keyword monitor")),
-            "aucune commande ne doit partir"
+            "no command should be sent"
         );
     }
 
     #[test]
     fn apply_rolls_back_when_the_result_is_wrong() {
-        // Le backend rapporte toujours 1920x1080 en 0x0 : la demande de 3000x0
-        // ne sera pas honorée, donc retour arrière.
+        // The backend always reports 1920x1080 at 0x0: the request for
+        // 3000x0 won't be honored, hence rollback.
         let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
         let backend = FakeBackend::with_monitors(&json);
         let layout = Layout::new(vec![want("DP-1", 1920, 1080, 3000, 0)]);
@@ -547,18 +569,18 @@ mod tests {
             .into_iter()
             .filter(|c| c.starts_with("[[BATCH]]"))
             .collect();
-        assert_eq!(batches.len(), 2, "application puis restauration");
+        assert_eq!(batches.len(), 2, "apply then restore");
         assert!(
             batches[1].contains("DP-1,1920x1080@60.00,0x0,1"),
-            "la restauration doit réécrire l'état d'origine : {}",
+            "restore must rewrite the original state: {}",
             batches[1]
         );
     }
 
     #[test]
     fn apply_waits_for_hyprland_to_catch_up() {
-        // Cas réel : une rotation met ~50 ms à se refléter dans j/monitors.
-        // Relire une seule fois ferait conclure à tort à un échec.
+        // Real-world case: a rotation takes ~50ms to show up in j/monitors.
+        // Reading only once would wrongly conclude failure.
         let rotated = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 1, false)]);
         let not_yet = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
         let backend = FakeBackend::settling_after(2, &not_yet, &rotated);
@@ -567,18 +589,18 @@ mod tests {
         w.transform = Transform::new(Rotation::R90, false);
         let report = apply(&backend, &Layout::new(vec![w]), false).unwrap();
 
-        assert!(report.succeeded(), "drifts : {:?}", report.drifts);
+        assert!(report.succeeded(), "drifts: {:?}", report.drifts);
         assert!(!report.rolled_back);
         assert!(
             backend.monitor_reads() >= 3,
-            "l'état doit être relu jusqu'à convergence"
+            "the state must be re-read until it converges"
         );
     }
 
     #[test]
     fn settling_also_waits_for_the_mirror_to_take_effect() {
-        // La duplication n'est qu'un avertissement, mais elle finit par
-        // s'appliquer : il faut l'attendre comme le reste.
+        // Mirroring is only a warning, but it does eventually apply: we
+        // must wait for it like everything else.
         let mirrored = r#"[
           {"id":0,"name":"eDP-1","width":1920,"height":1080,"refreshRate":60.0,"x":0,"y":0,
            "scale":1.0,"transform":0,"disabled":false,"mirrorOf":"none","availableModes":[]},
@@ -593,16 +615,12 @@ mod tests {
         let layout = Layout::new(vec![want("eDP-1", 1920, 1080, 0, 0), b]);
 
         let report = apply(&backend, &layout, false).unwrap();
-        assert_eq!(
-            report.drifts,
-            Vec::new(),
-            "la duplication doit être attendue"
-        );
+        assert_eq!(report.drifts, Vec::new(), "mirroring must be awaited");
     }
 
     #[test]
     fn an_adjusted_scale_does_not_stall_the_settle_loop() {
-        // Hyprland ne reviendra jamais sur son arrondi : inutile d'attendre.
+        // Hyprland will never revisit its rounding: no point waiting.
         let mut w = want("DP-1", 1920, 1080, 0, 0);
         w.scale = 1.37;
         let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.33, 0, false)]);
@@ -614,13 +632,13 @@ mod tests {
         assert_eq!(report.drifts.len(), 1);
         assert!(
             started.elapsed() < Duration::from_millis(400),
-            "l'application ne doit pas attendre la fin du délai de stabilisation"
+            "apply must not wait out the full settle timeout"
         );
     }
 
     #[test]
     fn settling_gives_up_and_reports_a_genuine_failure() {
-        // Rien ne bouge : au bout du délai, l'écart est bien signalé.
+        // Nothing moves: after the timeout, the drift is properly reported.
         let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
         let backend = FakeBackend::with_monitors(&json);
         let mut w = want("DP-1", 1920, 1080, 0, 0);

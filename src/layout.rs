@@ -1,34 +1,35 @@
-//! Description d'un agencement d'écrans, sa validation et son arrangement
-//! automatique.
+//! Description of a monitor layout, its validation and automatic
+//! arrangement.
 //!
-//! Tout ce module est purement calculatoire : aucune I/O, aucune dépendance à
-//! Hyprland. C'est ici que vivent les règles qui évitent d'envoyer au
-//! compositeur une configuration qui laisserait l'utilisateur devant un écran
-//! noir.
+//! This entire module is purely computational: no I/O, no dependency on
+//! Hyprland. This is where the rules live that keep us from sending the
+//! compositor a configuration that would leave the user staring at a black
+//! screen.
 
 use std::collections::HashMap;
 use std::fmt;
 
 use anyhow::{Result, bail};
+use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
 use crate::monitor::{Mode, Monitor, Transform};
 
-/// Hyprland raisonne en pas de 1/120 pour les échelles fractionnaires.
+/// Hyprland works in steps of 1/120 for fractional scales.
 const SCALE_STEP: f64 = 1.0 / 120.0;
-/// Tolérance d'arrondi pour juger qu'une taille logique est entière.
+/// Rounding tolerance used to decide whether a logical size is an integer.
 const EPSILON: f64 = 1e-3;
 
-/// Configuration désirée pour un écran.
+/// Desired configuration for a monitor.
 ///
-/// C'est le type pivot de l'application : la CLI, l'UI web, les profils et
-/// l'état live se traduisent tous en `OutputState`.
+/// This is the pivot type of the application: the CLI, the web UI, profiles
+/// and the live state all translate into `OutputState`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputState {
-    /// Nom du connecteur (`eDP-1`, `DP-3`…).
+    /// Connector name (`eDP-1`, `DP-3`…).
     pub name: String,
     pub enabled: bool,
-    /// `None` = laisser Hyprland choisir le mode préféré.
+    /// `None` = let Hyprland choose the preferred mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
     pub x: i32,
@@ -42,10 +43,10 @@ pub struct OutputState {
 }
 
 impl OutputState {
-    /// Configuration désirée reflétant l'état actuel d'un écran.
+    /// Desired configuration reflecting a monitor's current state.
     ///
-    /// `all` sert à résoudre la cible de duplication, que Hyprland désigne par
-    /// son identifiant numérique.
+    /// `all` is used to resolve the mirror target, which Hyprland designates
+    /// by its numeric id.
     pub fn from_monitor(m: &Monitor, all: &[Monitor]) -> Self {
         Self {
             name: m.name.clone(),
@@ -64,10 +65,10 @@ impl OutputState {
         }
     }
 
-    /// Taille occupée dans l'espace de travail, en pixels logiques.
+    /// Size occupied in the workspace, in logical pixels.
     ///
-    /// La rotation échange les axes ; l'échelle divise. Retourne `None` tant
-    /// que le mode n'a pas été résolu.
+    /// Rotation swaps the axes; scale divides. Returns `None` as long as the
+    /// mode hasn't been resolved.
     pub fn logical_size(&self) -> Option<(f64, f64)> {
         let m = self.mode?;
         let (w, h) = if self.transform.swaps_axes() {
@@ -78,7 +79,7 @@ impl OutputState {
         Some((f64::from(w) / self.scale, f64::from(h) / self.scale))
     }
 
-    /// Taille logique arrondie, telle que Hyprland la réservera.
+    /// Rounded logical size, as Hyprland will reserve it.
     pub fn logical_size_rounded(&self) -> (i32, i32) {
         match self.logical_size() {
             Some((w, h)) => (w.round() as i32, h.round() as i32),
@@ -86,21 +87,21 @@ impl OutputState {
         }
     }
 
-    /// Rectangle occupé : `(x1, y1, x2, y2)`, bord droit/bas exclus.
+    /// Occupied rectangle: `(x1, y1, x2, y2)`, right/bottom edge excluded.
     pub fn rect(&self) -> (i32, i32, i32, i32) {
         let (w, h) = self.logical_size_rounded();
         (self.x, self.y, self.x + w, self.y + h)
     }
 
-    /// Occupe-t-il de la place dans l'espace de travail ?
+    /// Does it take up space in the workspace?
     ///
-    /// Un écran en miroir se superpose volontairement à sa cible : il est exclu
-    /// de la détection de chevauchement.
+    /// A mirrored output deliberately overlaps its target: it is excluded
+    /// from overlap detection.
     pub fn occupies_space(&self) -> bool {
         self.enabled && self.mirror_of.is_none()
     }
 
-    /// Rend la directive Hyprland correspondante (partie après `monitor = `).
+    /// Renders the corresponding Hyprland directive (the part after `monitor = `).
     pub fn to_spec(&self) -> String {
         if !self.enabled {
             return format!("{},disable", self.name);
@@ -130,7 +131,7 @@ impl OutputState {
     }
 }
 
-/// Formate une échelle sans zéros parasites : `1`, `1.5`, `1.333333`.
+/// Formats a scale without trailing noise: `1`, `1.5`, `1.333333`.
 pub fn format_scale(scale: f64) -> String {
     let s = format!("{scale:.6}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
@@ -141,21 +142,21 @@ pub fn format_scale(scale: f64) -> String {
     }
 }
 
-/// Gravité d'un problème détecté dans un agencement.
+/// Severity of a problem detected in a layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
-    /// Bloquant : Hyprland refuserait la configuration, ou elle rendrait un
-    /// écran inutilisable.
+    /// Blocking: Hyprland would refuse the configuration, or it would
+    /// render an output unusable.
     Error,
-    /// Suspect mais applicable.
+    /// Suspicious but still applicable.
     Warning,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub severity: Severity,
-    /// Écrans concernés, pour que l'UI puisse les surligner.
+    /// Outputs involved, so the UI can highlight them.
     pub outputs: Vec<String>,
     pub message: String,
 }
@@ -163,14 +164,14 @@ pub struct Issue {
 impl fmt::Display for Issue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let tag = match self.severity {
-            Severity::Error => "erreur",
-            Severity::Warning => "avertissement",
+            Severity::Error => t!("layout.severity.error"),
+            Severity::Warning => t!("layout.severity.warning"),
         };
         write!(f, "[{tag}] {}", self.message)
     }
 }
 
-/// Un agencement complet, prêt à être validé puis appliqué.
+/// A complete layout, ready to be validated then applied.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub outputs: Vec<OutputState>,
@@ -181,7 +182,7 @@ impl Layout {
         Self { outputs }
     }
 
-    /// Agencement reflétant l'état live.
+    /// Layout reflecting the live state.
     pub fn from_monitors(monitors: &[Monitor]) -> Self {
         Self::new(
             monitors
@@ -203,7 +204,7 @@ impl Layout {
         self.outputs.iter().filter(|o| o.occupies_space())
     }
 
-    /// Directives Hyprland pour l'agencement entier.
+    /// Hyprland directives for the entire layout.
     pub fn to_specs(&self) -> Vec<String> {
         self.outputs.iter().map(OutputState::to_spec).collect()
     }
@@ -214,11 +215,11 @@ impl Layout {
             .any(|i| i.severity == Severity::Error)
     }
 
-    /// Passe en revue tous les pièges connus.
+    /// Reviews every known pitfall.
     pub fn validate(&self) -> Vec<Issue> {
         let mut issues = Vec::new();
 
-        // Doublons de connecteur : la dernière directive écraserait la première.
+        // Duplicate connector: the last directive would overwrite the first.
         let mut seen: HashMap<&str, usize> = HashMap::new();
         for o in &self.outputs {
             *seen.entry(o.name.as_str()).or_insert(0) += 1;
@@ -227,7 +228,12 @@ impl Layout {
             issues.push(Issue {
                 severity: Severity::Error,
                 outputs: vec![(*name).to_string()],
-                message: format!("l'écran « {name} » est défini {count} fois"),
+                message: t!(
+                    "layout.issue.duplicate_output",
+                    name = *name,
+                    count = count.to_string()
+                )
+                .to_string(),
             });
         }
 
@@ -240,14 +246,19 @@ impl Layout {
                 issues.push(Issue {
                     severity: Severity::Error,
                     outputs: vec![o.name.clone()],
-                    message: format!("échelle invalide pour « {} » : {}", o.name, o.scale),
+                    message: t!(
+                        "layout.issue.invalid_scale",
+                        name = o.name,
+                        scale = o.scale.to_string()
+                    )
+                    .to_string(),
                 });
                 continue;
             }
 
-            // Une échelle qui ne donne pas une taille logique entière n'est pas
-            // rejetée par Hyprland : il l'arrondit en silence. Autant prévenir
-            // de la valeur qui sera réellement utilisée.
+            // A scale that doesn't yield an integral logical size isn't
+            // rejected by Hyprland: it silently rounds it. Might as well warn
+            // about the value that will actually be used.
             if let Some((w, h)) = o.logical_size()
                 && (!is_integral(w) || !is_integral(h))
             {
@@ -255,36 +266,48 @@ impl Layout {
                 issues.push(Issue {
                     severity: Severity::Warning,
                     outputs: vec![o.name.clone()],
-                    message: format!(
-                        "l'échelle {} donne une taille logique non entière ({w:.3}x{h:.3}) pour « {} » : \
-                         Hyprland l'ajustera (autour de {})",
-                        format_scale(o.scale),
-                        o.name,
-                        format_scale(suggestion)
-                    ),
+                    message: t!(
+                        "layout.issue.non_integral_scale",
+                        scale = format_scale(o.scale),
+                        width = format!("{w:.3}"),
+                        height = format!("{h:.3}"),
+                        name = o.name,
+                        suggestion = format_scale(suggestion)
+                    )
+                    .to_string(),
                 });
             }
 
-            // Une cible de miroir absente fait échouer la directive.
+            // A missing mirror target makes the directive fail.
             if let Some(target) = &o.mirror_of {
                 match self.get(target) {
                     None => issues.push(Issue {
                         severity: Severity::Error,
                         outputs: vec![o.name.clone()],
-                        message: format!("« {} » duplique « {target} », qui n'existe pas", o.name),
+                        message: t!(
+                            "layout.issue.mirror_missing",
+                            name = o.name,
+                            target = target
+                        )
+                        .to_string(),
                     }),
                     Some(t) if !t.enabled => issues.push(Issue {
                         severity: Severity::Error,
                         outputs: vec![o.name.clone(), target.clone()],
-                        message: format!("« {} » duplique « {target} », qui est désactivé", o.name),
+                        message: t!(
+                            "layout.issue.mirror_disabled",
+                            name = o.name,
+                            target = target
+                        )
+                        .to_string(),
                     }),
                     Some(_) => {}
                 }
             }
         }
 
-        // Deux écrans qui se chevauchent : la zone commune devient inatteignable
-        // à la souris sur l'un des deux.
+        // Two outputs that overlap: the common area becomes unreachable by
+        // the mouse on one of them.
         let active: Vec<&OutputState> = self.active().collect();
         for (i, a) in active.iter().enumerate() {
             for b in &active[i + 1..] {
@@ -292,14 +315,14 @@ impl Layout {
                     issues.push(Issue {
                         severity: Severity::Error,
                         outputs: vec![a.name.clone(), b.name.clone()],
-                        message: format!("« {} » et « {} » se chevauchent", a.name, b.name),
+                        message: t!("layout.issue.overlap", a = a.name, b = b.name).to_string(),
                     });
                 }
             }
         }
 
-        // Un écran isolé reste accessible au clavier mais la souris ne peut pas
-        // l'atteindre : c'est un avertissement, pas une erreur.
+        // An isolated output stays reachable via the keyboard but the mouse
+        // can't reach it: that's a warning, not an error.
         if active.len() > 1 {
             for a in &active {
                 let touches = active
@@ -309,10 +332,7 @@ impl Layout {
                     issues.push(Issue {
                         severity: Severity::Warning,
                         outputs: vec![a.name.clone()],
-                        message: format!(
-                            "« {} » ne touche aucun autre écran : le curseur ne pourra pas y accéder",
-                            a.name
-                        ),
+                        message: t!("layout.issue.unreachable", name = a.name).to_string(),
                     });
                 }
             }
@@ -322,14 +342,14 @@ impl Layout {
             issues.push(Issue {
                 severity: Severity::Error,
                 outputs: Vec::new(),
-                message: "tous les écrans seraient désactivés".to_string(),
+                message: t!("layout.issue.all_disabled").to_string(),
             });
         }
 
         issues
     }
 
-    /// Ramène le coin supérieur gauche de l'ensemble à (0, 0).
+    /// Brings the top-left corner of the whole layout back to (0, 0).
     pub fn normalize(&mut self) {
         let min_x = self.active().map(|o| o.x).min().unwrap_or(0);
         let min_y = self.active().map(|o| o.y).min().unwrap_or(0);
@@ -342,9 +362,9 @@ impl Layout {
         }
     }
 
-    /// Range les écrans actifs côte à côte, de gauche à droite, alignés en haut.
+    /// Lines up the active outputs side by side, left to right, top-aligned.
     ///
-    /// C'est le repli quand aucun profil ne correspond au matériel branché.
+    /// This is the fallback when no profile matches the connected hardware.
     pub fn auto_arrange(&mut self) {
         let mut cursor = 0;
         for o in self.outputs.iter_mut().filter(|o| o.occupies_space()) {
@@ -354,21 +374,21 @@ impl Layout {
         }
     }
 
-    /// Applique une relation de placement : `subject` est posé contre `anchor`.
+    /// Applies a placement relation: `subject` is placed against `anchor`.
     pub fn place(&mut self, subject: &str, relation: Relation, anchor: &str) -> Result<()> {
         let (ax, ay, aw, ah) = match self.get(anchor) {
             Some(a) => {
                 let (w, h) = a.logical_size_rounded();
                 (a.x, a.y, w, h)
             }
-            None => bail!("écran de référence « {anchor} » inconnu"),
+            None => bail!(t!("layout.unknown_anchor", name = anchor).to_string()),
         };
         let (sw, sh) = match self.get(subject) {
             Some(s) => s.logical_size_rounded(),
-            None => bail!("écran « {subject} » inconnu"),
+            None => bail!(t!("layout.unknown_output", name = subject).to_string()),
         };
         if subject == anchor {
-            bail!("« {subject} » ne peut pas être positionné par rapport à lui-même");
+            bail!(t!("layout.self_reference", name = subject).to_string());
         }
 
         let (x, y) = match relation {
@@ -379,14 +399,14 @@ impl Layout {
             Relation::SameAs => (ax, ay),
         };
 
-        let s = self.get_mut(subject).expect("vérifié plus haut");
+        let s = self.get_mut(subject).expect("checked above");
         s.x = x;
         s.y = y;
         Ok(())
     }
 }
 
-/// Relations de placement acceptées par `hyprmc arrange`.
+/// Placement relations accepted by `hyprdmc arrange`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Relation {
     LeftOf,
@@ -406,9 +426,7 @@ impl std::str::FromStr for Relation {
             "above" | "au-dessus-de" | "up" => Relation::Above,
             "below" | "en-dessous-de" | "down" => Relation::Below,
             "same-as" | "mirror-position" => Relation::SameAs,
-            other => bail!(
-                "relation inconnue « {other} » (attendu left-of, right-of, above, below, same-as)"
-            ),
+            other => bail!(t!("layout.unknown_relation", value = other).to_string()),
         })
     }
 }
@@ -421,7 +439,7 @@ fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
     a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
 }
 
-/// Les rectangles partagent-ils un bord sur une longueur non nulle ?
+/// Do the rectangles share an edge over a non-zero length?
 fn rects_touch(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
     let x_overlap = a.0 < b.2 && b.0 < a.2;
     let y_overlap = a.1 < b.3 && b.1 < a.3;
@@ -430,11 +448,11 @@ fn rects_touch(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
     (x_adjacent && y_overlap) || (y_adjacent && x_overlap)
 }
 
-/// Cherche l'échelle valide la plus proche de celle demandée.
+/// Finds the valid scale closest to the one requested.
 ///
-/// Hyprland exige que `taille / échelle` tombe sur un entier ; il travaille par
-/// pas de 1/120. On balaie ces pas autour de la valeur souhaitée et on retient
-/// le premier candidat acceptable.
+/// Hyprland requires that `size / scale` land on an integer; it works in
+/// steps of 1/120. We sweep these steps around the desired value and keep
+/// the first acceptable candidate.
 pub fn nearest_valid_scale(mode: Mode, transform: Transform, wanted: f64) -> f64 {
     let (w, h) = if transform.swaps_axes() {
         (mode.height, mode.width)
@@ -447,7 +465,7 @@ pub fn nearest_valid_scale(mode: Mode, transform: Transform, wanted: f64) -> f64
     }
 
     let base = (wanted / SCALE_STEP).round();
-    // ±0.5 autour de la valeur demandée, soit 60 pas de chaque côté.
+    // ±0.5 around the requested value, i.e. 60 steps on each side.
     for step in 1..=60 {
         for candidate in [(base + f64::from(step)), (base - f64::from(step))] {
             let s = candidate * SCALE_STEP;
@@ -545,7 +563,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|i| i.severity == Severity::Error && i.message.contains("chevauchent"))
+                .any(|i| i.severity == Severity::Error && i.message.contains("overlap"))
         );
     }
 
@@ -571,7 +589,7 @@ mod tests {
 
     #[test]
     fn corner_contact_does_not_count_as_touching() {
-        // Coin contre coin : aucun bord partagé, le curseur ne passe pas.
+        // Corner against corner: no shared edge, the cursor can't cross.
         let layout = Layout::new(vec![
             out("A", 1920, 1080, 0, 0),
             out("B", 1920, 1080, 1920, 1080),
@@ -612,7 +630,7 @@ mod tests {
             layout
                 .validate()
                 .iter()
-                .any(|i| i.message.contains("défini 2 fois"))
+                .any(|i| i.message.contains("defined 2 times"))
         );
     }
 
@@ -625,16 +643,16 @@ mod tests {
 
     #[test]
     fn non_integral_scale_warns_without_blocking() {
-        // Hyprland accepte 1.37 puis l'arrondit à 1.33 en silence : c'est un
-        // avertissement, pas un refus.
+        // Hyprland accepts 1.37 and silently rounds it to 1.33: that's a
+        // warning, not a refusal.
         let mut o = out("DP-1", 1920, 1080, 0, 0);
         o.scale = 1.37;
         let layout = Layout::new(vec![o]);
         let issues = layout.validate();
         let issue = issues
             .iter()
-            .find(|i| i.message.contains("non entière"))
-            .expect("l'échelle bancale doit être signalée");
+            .find(|i| i.message.contains("non-integral"))
+            .expect("the wonky scale should be reported");
         assert_eq!(issue.severity, Severity::Warning);
         assert!(!layout.has_errors());
     }
@@ -645,7 +663,7 @@ mod tests {
         let s = nearest_valid_scale(mode, Transform::default(), 1.37);
         assert!((1920.0 / s - (1920.0 / s).round()).abs() < 1e-3);
         assert!((1080.0 / s - (1080.0 / s).round()).abs() < 1e-3);
-        assert!((s - 1.37).abs() < 0.5, "échelle trop éloignée : {s}");
+        assert!((s - 1.37).abs() < 0.5, "scale too far off: {s}");
     }
 
     #[test]
@@ -678,7 +696,7 @@ mod tests {
         a.transform = Transform::new(Rotation::R90, false);
         let mut layout = Layout::new(vec![a, out("B", 1920, 1080, 0, 0)]);
         layout.auto_arrange();
-        // A tourné occupe 1080 de large.
+        // A rotated occupies 1080 of width.
         assert_eq!(layout.get("B").unwrap().x, 1080);
         assert!(!layout.has_errors());
     }
