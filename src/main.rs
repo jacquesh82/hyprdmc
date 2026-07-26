@@ -50,7 +50,98 @@ async fn main() -> Result<()> {
         Command::Init { dry_run } => cmd_init(dry_run),
         Command::Daemon { web, no_web } => cmd_daemon(web, !no_web).await,
         Command::Web { web } => cmd_web(web).await,
+        Command::Service { action } => cmd_service(action),
     }
+}
+
+// --------------------------------------------------------------- service --
+
+/// Installs, removes or inspects the systemd user service.
+///
+/// No argument means `install`: that is what someone typing `hyprdmc service`
+/// is after, and the command is idempotent — rewriting the same unit costs
+/// nothing.
+fn cmd_service(action: Option<hyprdmc::cli::ServiceAction>) -> Result<()> {
+    use hyprdmc::cli::ServiceAction;
+    use hyprdmc::service;
+
+    match action.unwrap_or(ServiceAction::Install {
+        enable: false,
+        wanted_by: service::DEFAULT_TARGET.to_string(),
+        dry_run: false,
+    }) {
+        ServiceAction::Install {
+            enable,
+            wanted_by,
+            dry_run: true,
+        } => {
+            let _ = enable;
+            print!(
+                "{}",
+                service::render_unit(&std::env::current_exe()?, &wanted_by)
+            );
+            println!(
+                "{}",
+                t!(
+                    "cli.service.dry_run",
+                    path = service::unit_path().display().to_string()
+                )
+            );
+        }
+
+        ServiceAction::Install {
+            enable, wanted_by, ..
+        } => {
+            let done = service::install(&wanted_by, enable)?;
+            println!(
+                "{}",
+                t!(
+                    "cli.service.installed",
+                    path = done.path.display().to_string()
+                )
+            );
+            if done.enabled {
+                println!("{}", t!("cli.service.enabled"));
+            } else {
+                println!("{}", t!("cli.service.enable_hint", unit = service::UNIT));
+            }
+            // A unit whose target never activates is a unit that never runs,
+            // and nothing about it looks wrong until you reboot and wonder.
+            if done.target_inactive {
+                println!("{}", t!("cli.service.target_inactive", target = wanted_by));
+            }
+        }
+
+        ServiceAction::Uninstall => match service::uninstall()? {
+            Some(path) => println!(
+                "{}",
+                t!("cli.service.uninstalled", path = path.display().to_string())
+            ),
+            None => println!("{}", t!("cli.service.not_installed")),
+        },
+
+        ServiceAction::Status => {
+            let status = service::status();
+            let state = |yes: bool| {
+                if yes {
+                    t!("cli.service.yes")
+                } else {
+                    t!("cli.service.no")
+                }
+            };
+            println!(
+                "{}",
+                t!(
+                    "cli.service.status",
+                    path = status.path.display().to_string(),
+                    installed = state(status.installed),
+                    enabled = state(status.enabled),
+                    active = state(status.active)
+                )
+            );
+        }
+    }
+    Ok(())
 }
 
 fn init_tracing(verbose: bool) {

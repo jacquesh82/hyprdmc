@@ -101,6 +101,37 @@ pub enum Command {
         #[command(flatten)]
         web: WebArgs,
     },
+
+    /// Start the daemon with the session: the systemd user service.
+    Service {
+        #[command(subcommand)]
+        action: Option<ServiceAction>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Writes the unit to `~/.config/systemd/user/` (the default).
+    Install {
+        /// Enable and start it straight away.
+        #[arg(long)]
+        enable: bool,
+
+        /// Systemd target to start with. Use `hyprland-session.target` if
+        /// that is what your session activates.
+        #[arg(long, default_value = crate::service::DEFAULT_TARGET)]
+        wanted_by: String,
+
+        /// Print the unit instead of writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Disables the service and removes the unit.
+    Uninstall,
+
+    /// Says whether the service is installed, enabled and running.
+    Status,
 }
 
 #[derive(Debug, Args)]

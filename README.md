@@ -62,6 +62,8 @@ the right profile on its own** whenever the hardware changes.
   what you type in.
 - **Import / export** — the whole configuration in one JSON file, to back up or move to
   another machine. The listening port and the generated-file paths stay local on import.
+- **Autostart** — `hyprdmc service install` writes a systemd *user* unit; the same one works
+  on Debian, Fedora/RHEL and Arch. A Hyprland autostart line does the job too.
 - **No dependencies** — talks directly to Hyprland's sockets, `hyprctl` isn't required.
   No JavaScript toolchain either: the web UI is embedded in the binary.
 
@@ -95,12 +97,33 @@ hyprdmc arrange DP-1 right-of eDP-1
 
 # 3. Save the current layout under a name
 hyprdmc profile save desk
+```
 
-# 4. Wire monitors.lua and input.lua into hyprland.lua (backs it up automatically)
-hyprdmc init
+**Make it survive a reboot.** `init` writes the two generated files and adds one `require`
+each to your `hyprland.lua`, after backing it up. Run it once:
 
-# 5. Start the daemon: hotplug watcher + web UI on http://127.0.0.1:8787
-hyprdmc daemon
+```sh
+hyprdmc init --dry-run    # show the modified hyprland.lua without touching it
+hyprdmc init              # back up, wire monitors.lua and input.lua, write both
+```
+
+**Start the daemon**, which watches for hotplug events *and* serves the web UI:
+
+```sh
+hyprdmc daemon            # UI on http://127.0.0.1:8787, no browser opened
+hyprdmc daemon --open     # …and open it
+hyprdmc web               # UI only, no hotplug watcher — opens the browser by default
+```
+
+Open <http://127.0.0.1:8787> and arrange your screens with the mouse:
+
+![The hyprdmc web interface: two screens on the arrangement canvas, the settings panel on
+the right](docs/web-ui.png)
+
+**Have it start with your session** — see [Starting automatically](#starting-automatically):
+
+```sh
+hyprdmc service install --enable
 ```
 
 ## Web UI
@@ -331,7 +354,10 @@ applies the matching profile. It reconnects on its own if Hyprland restarts.
 
 ### Starting automatically
 
-With Hyprland, in `hyprland.lua`:
+Two ways, and which one is right depends on your session.
+
+**The Hyprland autostart** works everywhere, because Hyprland runs it itself, once it is up
+and with the right environment. In `hyprland.lua`:
 
 ```lua
 hl.on("hyprland.start", function ()
@@ -339,28 +365,41 @@ hl.on("hyprland.start", function ()
 end)
 ```
 
-Or as a systemd user service — `~/.config/systemd/user/hyprdmc.service`:
-
-```ini
-[Unit]
-Description=Dynamic monitor configuration for Hyprland
-PartOf=graphical-session.target
-After=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/hyprdmc daemon
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=graphical-session.target
-```
+**The systemd user service** buys you restart-on-failure and `journalctl` logs. Debian,
+Fedora/RHEL and Arch all run systemd and all three give each login session a
+`systemd --user` instance, so the same *user* unit covers the three — there is nothing
+distribution-specific in it, and nothing installed as root: the daemon drives one session's
+displays.
 
 ```sh
-systemctl --user daemon-reload
-systemctl --user enable --now hyprdmc.service
+hyprdmc service install --enable      # write the unit, enable and start it
+hyprdmc service install --dry-run     # print it instead, and write nothing
+hyprdmc service status                # installed? enabled? running?
+hyprdmc service uninstall             # disable and remove
 ```
+
+The unit is generated rather than copied from this README, because its one important line
+is the path to the binary — `/usr/bin`, `~/.cargo/bin` or `~/.local/bin` depending on how
+you installed it. `service install` reads that path from the running executable.
+
+> **The catch, and it is a real one.** The unit hooks onto `graphical-session.target`, which
+> is only reached if something in your session activates it. `uwsm` does; a plain
+> `exec-once = Hyprland` does not — and then the service sits there, enabled, never
+> starting, with nothing that looks wrong. `hyprdmc service install` checks and tells you
+> when that is the case.
+>
+> If your session does not activate it, either point the unit at a target that is reached:
+>
+> ```sh
+> hyprdmc service install --wanted-by default.target --enable
+> ```
+>
+> (systemd reaches `default.target` well before the compositor exists, so the daemon will
+> fail its first attempts; the unit retries for about a minute, which covers a normal
+> login), or simply use the Hyprland autostart above.
+
+A packaged reference unit for `/usr/lib/systemd/user/` lives in
+[`packaging/systemd/hyprdmc.service`](packaging/systemd/hyprdmc.service).
 
 ## Persistence
 

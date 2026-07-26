@@ -1,0 +1,32 @@
+# Reference unit, for distribution packages.
+#
+# `hyprdmc service install` generates this file with the path of the binary it
+# was run from, which is what you want when hyprdmc lives in ~/.cargo/bin or
+# ~/.local/bin. This copy assumes a packaged binary in /usr/bin, and belongs in
+# /usr/lib/systemd/user/ so that every user can `systemctl --user enable` it.
+#
+# It is a *user* unit on purpose: the daemon drives one session's displays and
+# talks to that session's Hyprland socket. There is nothing for it to do as
+# root, on any distribution.
+#
+# WantedBy=graphical-session.target only fires if the session activates that
+# target (uwsm does, a bare `exec-once = Hyprland` does not). On a session that
+# does not, either change WantedBy to a target that is reached, or use the
+# Hyprland autostart described in the README.
+[Unit]
+Description=Dynamic monitor configuration for Hyprland
+Documentation=https://github.com/jacquesh82/hyprdmc
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=20
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/hyprdmc daemon
+Restart=on-failure
+RestartSec=3
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

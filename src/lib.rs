@@ -22,4 +22,5 @@ pub mod ipc;
 pub mod layout;
 pub mod monitor;
 pub mod notify;
+pub mod service;
 pub mod web;
