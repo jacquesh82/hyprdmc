@@ -80,6 +80,12 @@ install -Dm755 target/release/hyprdmc ~/.local/bin/hyprdmc
 
 Rust 1.87 or newer (2024 edition). Hyprland 0.40+; developed and tested against 0.56.
 
+### From a distribution package
+
+Definitions for Arch (`PKGBUILD`), Fedora/RHEL (`.spec`) and Debian/Ubuntu
+(`debian/`) live in [`packaging/`](packaging/README.md), which also documents what
+it takes to get each one into the AUR, COPR, a PPA or an APT repository.
+
 ### With cargo
 
 ```sh

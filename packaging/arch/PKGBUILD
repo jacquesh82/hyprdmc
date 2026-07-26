@@ -1,0 +1,53 @@
+# Maintainer: Jacques Hullu <jacques@hullu.fr>
+
+pkgname=hyprdmc
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Dynamic monitor configuration for Hyprland: CLI, web UI, and hotplug profiles"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jacquesh82/hyprdmc"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+# Hyprland is what this configures, but it is not needed to install or build:
+# the binary talks to a socket that may well belong to another machine's
+# session in a container build.
+optdepends=(
+  'hyprland: the compositor this configures'
+  'xkeyboard-config: full keyboard layout catalogue in the web UI'
+  'libnotify: desktop notifications on hotplug'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # replace with `updpkgsums` once the tag exists
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # Downloads dependencies while the network is still allowed, so that
+  # build() and check() can run with --frozen.
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-features
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --all-features
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  # A *user* unit: the daemon drives one session's displays and has nothing to
+  # do as root. Users enable it with `systemctl --user enable --now hyprdmc`.
+  install -Dm0644 packaging/systemd/hyprdmc.service \
+    "$pkgdir/usr/lib/systemd/user/hyprdmc.service"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

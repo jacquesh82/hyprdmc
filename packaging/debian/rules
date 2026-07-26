@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+# Simple cargo build. Debian's own Rust policy (dh-cargo, one source package
+# per crate) applies to packages entering the official archive; this file is
+# what you want for a personal repository, a PPA, or an OBS project — see
+# packaging/README.md.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_HOME = $(CURDIR)/debian/cargo
+# Keep the build out of ~/.cargo and away from the network when the source
+# ships vendored dependencies.
+export CARGO_TARGET_DIR = $(CURDIR)/target
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+	cargo test --release --locked
+
+override_dh_auto_install:
+	install -Dpm0755 target/release/hyprdmc debian/hyprdmc/usr/bin/hyprdmc
+	# A *user* unit: the daemon drives one session's displays, never root's.
+	install -Dpm0644 packaging/systemd/hyprdmc.service \
+		debian/hyprdmc/usr/lib/systemd/user/hyprdmc.service
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo

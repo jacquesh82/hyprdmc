@@ -1,0 +1,31 @@
+Source: hyprdmc
+Section: x11
+Priority: optional
+Maintainer: Jacques Hullu <jacques@hullu.fr>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo (>= 1.87),
+ rustc (>= 1.87),
+ pkg-config,
+Standards-Version: 4.6.2
+Homepage: https://github.com/jacquesh82/hyprdmc
+Rules-Requires-Root: no
+Vcs-Git: https://github.com/jacquesh82/hyprdmc.git
+Vcs-Browser: https://github.com/jacquesh82/hyprdmc
+
+Package: hyprdmc
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+# The web UI reads the xkb catalogue from xkb-data; without it the layout list
+# falls back to a short built-in one, so the tool still works.
+Recommends: xkb-data, libnotify-bin
+Suggests: hyprland
+Description: dynamic monitor configuration for Hyprland
+ hyprdmc detects Hyprland outputs and positions, rotates, flips or mirrors
+ them from a command line or a browser. A daemon watches for hotplug events
+ and reapplies the profile matching the screens actually plugged in, with an
+ automatic rollback when a change is not confirmed.
+ .
+ It also configures the keyboard layout and the pointer scroll direction,
+ deliberately kept apart from the screen profiles: docking a laptop must not
+ change what you type in.
