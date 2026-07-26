@@ -70,7 +70,7 @@ pub enum Command {
         safety: SafetyArgs,
     },
 
-    /// Writes the current layout to `monitors.conf`.
+    /// Writes the current layout to `monitors.lua`.
     Persist,
 
     /// The last few layouts that were applied, and how to get back to them.
@@ -79,7 +79,7 @@ pub enum Command {
         action: Option<HistoryAction>,
     },
 
-    /// Wires `monitors.conf` into `hyprland.conf`.
+    /// Wires `monitors.lua` and `input.lua` into `hyprland.lua`.
     Init {
         /// Shows what would be done without changing anything.
         #[arg(long)]

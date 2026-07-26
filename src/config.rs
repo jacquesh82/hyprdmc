@@ -24,8 +24,12 @@ pub struct Settings {
     /// Delay before automatically reverting if the user does not confirm.
     /// `0` disables the safety net.
     pub confirm_timeout_secs: u64,
-    /// Generated file, to be sourced from `hyprland.conf`.
-    pub monitors_conf: PathBuf,
+    /// Generated file, to be required from `hyprland.lua`.
+    #[serde(alias = "monitors_conf")]
+    pub monitors_lua: PathBuf,
+    /// Generated file for the keyboard and pointer settings. Separate from
+    /// `monitors_lua` so that rewriting one never touches the other.
+    pub input_lua: PathBuf,
     /// Interface language (`en`, `fr`). Unset means "follow the system
     /// locale"; see [`crate::i18n`] for the full resolution order.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,7 +48,8 @@ impl Default for Settings {
             bind: "127.0.0.1".to_string(),
             auto_apply: true,
             confirm_timeout_secs: 10,
-            monitors_conf: default_monitors_conf(),
+            monitors_lua: default_monitors_lua(),
+            input_lua: default_input_lua(),
             language: None,
             notifications: true,
             remember: true,
@@ -264,6 +269,12 @@ fn place_free_outputs(layout: &mut Layout, free: &[String]) {
 pub struct Config {
     #[serde(default)]
     pub settings: Settings,
+    /// Keyboard and pointer, recorded as last applied.
+    ///
+    /// Outside `profiles` on purpose: a profile describes screens, and
+    /// plugging in a monitor has no business changing the keyboard layout.
+    #[serde(default)]
+    pub input: crate::input::InputConfig,
     #[serde(default, rename = "profile")]
     pub profiles: Vec<Profile>,
 }
@@ -380,20 +391,24 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-fn default_monitors_conf() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"))
-        .join("hypr")
-        .join("monitors.conf")
+fn default_monitors_lua() -> PathBuf {
+    hypr_dir().join("monitors.lua")
 }
 
-pub fn hyprland_conf() -> PathBuf {
+fn default_input_lua() -> PathBuf {
+    hypr_dir().join("input.lua")
+}
+
+/// The user's main configuration file. Lua since Hyprland 0.55.
+pub fn hyprland_lua() -> PathBuf {
+    hypr_dir().join("hyprland.lua")
+}
+
+fn hypr_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
         .join("hypr")
-        .join("hyprland.conf")
 }
 
 pub fn home() -> PathBuf {
@@ -517,6 +532,7 @@ mod tests {
     fn best_match_prefers_the_most_specific_profile() {
         let cfg = Config {
             settings: Settings::default(),
+            input: crate::input::InputConfig::default(),
             profiles: vec![
                 Profile {
                     name: "solo".into(),
@@ -631,6 +647,7 @@ mod tests {
     fn rotation_and_flip_survive_a_round_trip_through_toml() {
         let cfg = Config {
             settings: Settings::default(),
+            input: crate::input::InputConfig::default(),
             profiles: vec![Profile {
                 name: "portrait".into(),
                 exact: false,

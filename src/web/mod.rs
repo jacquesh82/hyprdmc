@@ -65,6 +65,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/profiles/{name}/apply", post(apply_profile))
         .route("/api/history", get(get_history))
         .route("/api/history/{index}/restore", post(restore_history))
+        .route("/api/input", get(get_input).put(put_input))
+        .route("/api/input/persist", post(persist_input))
+        .route("/api/config", get(export_config).post(import_config))
         .route("/api/events", get(sse_events))
         .route("/api/i18n", get(get_i18n))
         .fallback(static_handler)
@@ -126,7 +129,9 @@ async fn post_apply(
     axum::Json(req): axum::Json<ApplyRequest>,
 ) -> ApiResult<axum::Json<serde_json::Value>> {
     let layout = Layout::new(req.outputs);
-    let report = state.apply(layout, req.force, req.guard).await?;
+    // No profile: the web UI edits a layout by hand. Saving it under a name is
+    // a separate, deliberate action (PUT /api/profiles/{name}).
+    let report = state.apply(layout, req.force, req.guard, None).await?;
     Ok(axum::Json(json!(report)))
 }
 
@@ -148,9 +153,80 @@ async fn post_persist(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<axum::Json<serde_json::Value>> {
     let layout = Layout::from_monitors(&state.monitors().await?);
-    let path = state.config.read().await.settings.monitors_conf.clone();
+    let path = state.config.read().await.settings.monitors_lua.clone();
     emit::persist(&layout, &path)?;
     Ok(axum::Json(json!({ "path": path })))
+}
+
+// ----------------------------------------------------------- import/export --
+
+/// Marker carried by an exported file, so an import can tell a hyprdmc
+/// configuration from any other JSON the user happened to pick.
+const BUNDLE_KIND: &str = "hyprdmc-config";
+/// Bumped when the shape changes in a way an older hyprdmc cannot read.
+const BUNDLE_VERSION: u32 = 1;
+
+/// What travels in an exported file.
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct ConfigBundle {
+    kind: String,
+    version: u32,
+    config: crate::config::Config,
+}
+
+/// The whole configuration, as a file to keep.
+async fn export_config(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    let config = state.config.read().await.clone();
+    Ok(axum::Json(json!(ConfigBundle {
+        kind: BUNDLE_KIND.to_string(),
+        version: BUNDLE_VERSION,
+        config,
+    })))
+}
+
+/// Replaces the configuration with an exported one.
+///
+/// Machine-local plumbing is deliberately *not* imported: the listening port,
+/// the bind address and the two generated-file paths stay as they are here. A
+/// configuration exported on another machine carries that machine's home
+/// directory, and silently writing `monitors.lua` into a path that does not
+/// exist on this one is a bug waiting to be reported as "hyprdmc stopped
+/// working". Everything the user actually meant to move — profiles, keyboard
+/// and pointer, behaviour — comes across.
+async fn import_config(
+    State(state): State<Arc<AppState>>,
+    axum::Json(bundle): axum::Json<ConfigBundle>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    if bundle.kind != BUNDLE_KIND {
+        return Err(anyhow::anyhow!(rust_i18n::t!("config.not_a_bundle").to_string()).into());
+    }
+    if bundle.version > BUNDLE_VERSION {
+        return Err(anyhow::anyhow!(
+            rust_i18n::t!(
+                "config.bundle_too_new",
+                version = bundle.version,
+                supported = BUNDLE_VERSION
+            )
+            .to_string()
+        )
+        .into());
+    }
+
+    let mut cfg = state.config.write().await;
+    let local = cfg.settings.clone();
+    *cfg = bundle.config;
+    cfg.settings.web_port = local.web_port;
+    cfg.settings.bind = local.bind;
+    cfg.settings.monitors_lua = local.monitors_lua;
+    cfg.settings.input_lua = local.input_lua;
+    let path = cfg.save()?;
+    let profiles = cfg.profiles.len();
+    drop(cfg);
+
+    state.broadcast().await;
+    Ok(axum::Json(json!({ "profiles": profiles, "path": path })))
 }
 
 async fn get_profiles(
@@ -229,8 +305,74 @@ async fn apply_profile(
         })?;
         profile.resolve(&monitors)?
     };
-    let report = state.apply(layout, false, true).await?;
+    let report = state.apply(layout, false, true, Some(name)).await?;
     Ok(axum::Json(json!(report)))
+}
+
+// ------------------------------------------------------------------ input --
+
+/// Keyboard and pointer settings, plus the catalogue the UI needs to offer a
+/// choice at all.
+///
+/// The values come from the compositor rather than from `config.toml`: what is
+/// live is the truth, and a layout set by hand in `hyprland.lua` must show up
+/// here instead of being silently overwritten by a default.
+async fn get_input(State(state): State<Arc<AppState>>) -> ApiResult<axum::Json<serde_json::Value>> {
+    let backend = Arc::clone(&state.backend);
+    let current =
+        tokio::task::spawn_blocking(move || crate::input::InputConfig::read(backend.as_ref()))
+            .await
+            .map_err(anyhow::Error::from)??;
+    // Parsing the xkb rules means reading a ~100 kB file: off the executor,
+    // like every other blocking call here.
+    let catalog = tokio::task::spawn_blocking(crate::input::catalog)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(axum::Json(json!({
+        "current": current,
+        "catalog": catalog,
+        "path": state.config.read().await.settings.input_lua,
+    })))
+}
+
+/// Applies the settings and records them in `config.toml`.
+///
+/// No revert guard here, unlike the screen layout: a keyboard layout you
+/// cannot type in is annoying, not a lock-out — the mouse still works, and the
+/// UI is still readable. The countdown is for changes that can leave you
+/// staring at a black screen.
+async fn put_input(
+    State(state): State<Arc<AppState>>,
+    axum::Json(input): axum::Json<crate::input::InputConfig>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    input.validate()?;
+
+    let backend = Arc::clone(&state.backend);
+    let target = input.clone();
+    tokio::task::spawn_blocking(move || target.apply(backend.as_ref()))
+        .await
+        .map_err(anyhow::Error::from)??;
+
+    let mut cfg = state.config.write().await;
+    cfg.input = input.clone();
+    cfg.save()?;
+    Ok(axum::Json(json!({ "applied": input })))
+}
+
+/// Writes `input.lua`, so the settings survive a compositor restart.
+async fn persist_input(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    let backend = Arc::clone(&state.backend);
+    // The live state again, not `config.toml`: what gets written is what the
+    // user is currently using.
+    let current =
+        tokio::task::spawn_blocking(move || crate::input::InputConfig::read(backend.as_ref()))
+            .await
+            .map_err(anyhow::Error::from)??;
+    let path = state.config.read().await.settings.input_lua.clone();
+    emit::persist_input(&current, &path)?;
+    Ok(axum::Json(json!({ "path": path })))
 }
 
 async fn get_history(
@@ -302,11 +444,21 @@ const WEB_KEYS: &[&str] = &[
     "web.hint",
     "web.select_prompt",
     "web.guard.applied",
+    "web.guard.countdown",
+    "web.guard.aria",
     "web.guard.keep",
     "web.guard.revert",
+    "web.guard.keys",
     "web.action.apply",
+    "web.action.apply_title",
+    "web.action.pending",
     "web.action.reset",
     "web.action.auto",
+    "web.action.rescan",
+    "web.action.export",
+    "web.action.export_title",
+    "web.action.import",
+    "web.action.import_title",
     "web.action.save",
     "web.action.persist",
     "web.field.enabled",
@@ -326,6 +478,12 @@ const WEB_KEYS: &[&str] = &[
     "web.toast.reverted",
     "web.toast.profile_saved",
     "web.toast.persisted",
+    "web.toast.rescan_found",
+    "web.toast.rescan_none",
+    "web.toast.exported",
+    "web.toast.imported",
+    "web.toast.import_unreadable",
+    "web.import.confirm",
     "web.issue.overlap",
     "web.issue.all_disabled",
     "web.issue.mirror_unavailable",
@@ -341,8 +499,31 @@ const WEB_KEYS: &[&str] = &[
     "web.history.restore",
     "web.history.restore_aria",
     "web.history.restored",
+    "web.history.close",
     "web.no_outputs",
     "web.disconnected",
+    "web.tabs_label",
+    "web.tab.screens",
+    "web.tab.input",
+    "web.input.keyboard",
+    "web.input.layout",
+    "web.input.variant",
+    "web.input.variant_none",
+    "web.input.variant_help",
+    "web.input.options",
+    "web.input.options_add",
+    "web.input.options_none",
+    "web.input.option_remove",
+    "web.input.pointer",
+    "web.input.touchpad",
+    "web.input.mouse",
+    "web.input.scroll",
+    "web.input.scroll_normal",
+    "web.input.scroll_inverted",
+    "web.input.scroll_help",
+    "web.input.note",
+    "web.toast.input_applied",
+    "web.toast.input_persisted",
 ];
 
 /// Serves the strings the UI needs for the active locale.

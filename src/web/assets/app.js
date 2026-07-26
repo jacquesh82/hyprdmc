@@ -29,13 +29,23 @@ const I18N_DEFAULTS = {
   'web.canvas_label': 'Display arrangement',
   'web.hint': "Drag an output to move it — it snaps to neighbouring edges. Arrow keys for fine adjustment.",
   'web.select_prompt': 'Select an output to configure it.',
-  'web.guard.applied': 'Configuration applied. Automatic revert in %{seconds}s.',
+  'web.guard.applied': 'Configuration applied — keep it?',
+  'web.guard.countdown': 'Reverting automatically in %{seconds} s.',
+  'web.guard.aria': 'Configuration applied. %{seconds} seconds before it is reverted automatically. Keep it?',
   'web.guard.keep': 'Keep',
-  'web.guard.revert': 'Revert',
+  'web.guard.revert': 'Revert now',
+  'web.guard.keys': 'Enter to keep · Esc to revert',
   'web.action.apply': 'Apply',
+  'web.action.apply_title': 'Apply the pending changes (Ctrl+Enter)',
+  'web.action.pending': '%{count} change(s)',
   'web.action.reset': 'Discard changes',
   'web.action.auto': 'Arrange automatically',
+  'web.action.rescan': 'Detect new displays',
   'web.action.save': 'Save as profile…',
+  'web.action.export': 'Export',
+  'web.action.export_title': 'Download the whole configuration as a JSON file',
+  'web.action.import': 'Import',
+  'web.action.import_title': 'Replace the configuration with an exported file',
   'web.action.persist': 'Make permanent',
   'web.field.enabled': 'Output enabled',
   'web.field.mode': 'Mode',
@@ -54,6 +64,12 @@ const I18N_DEFAULTS = {
   'web.toast.reverted': 'Previous configuration restored.',
   'web.toast.profile_saved': 'Profile "%{name}" saved.',
   'web.toast.persisted': 'Layout written to %{path}.',
+  'web.toast.rescan_found': 'New display detected: %{names}.',
+  'web.toast.rescan_none': 'No new display: the list is up to date.',
+  'web.toast.exported': 'Configuration exported to %{name}.',
+  'web.toast.imported': '%{count} profile(s) imported into %{path}.',
+  'web.toast.import_unreadable': 'Unreadable file: this is not valid JSON.',
+  'web.import.confirm': 'Replace the current configuration with this file (%{count} profile(s), keyboard and pointer, behaviour)?\n\nThe web port and the paths of the generated files stay as they are on this machine.',
   'web.issue.overlap': '"%{a}" and "%{b}" overlap',
   'web.issue.all_disabled': 'every output would be disabled',
   'web.issue.mirror_unavailable': '"%{name}" mirrors an unavailable output',
@@ -73,6 +89,31 @@ const I18N_DEFAULTS = {
   'web.history.restore': 'Restore',
   'web.history.restore_aria': 'Restore the configuration from %{when}',
   'web.history.restored': 'Configuration #%{index} restored (%{when}).',
+  'web.history.close': 'Close',
+  // Tabs.
+  'web.tabs_label': 'Sections',
+  'web.tab.screens': 'Displays',
+  'web.tab.input': 'Keyboard & pointer',
+  // Keyboard and pointer.
+  'web.input.keyboard': 'Keyboard',
+  'web.input.layout': 'Layout',
+  'web.input.variant': 'Variant',
+  'web.input.variant_none': 'none (plain layout)',
+  'web.input.variant_help': 'Variants of the selected layout only.',
+  'web.input.options': 'Options',
+  'web.input.options_add': 'Add an option…',
+  'web.input.options_none': 'No option set.',
+  'web.input.option_remove': 'Remove the option %{name}',
+  'web.input.pointer': 'Pointer',
+  'web.input.touchpad': 'Touchpad',
+  'web.input.mouse': 'Mouse',
+  'web.input.scroll': 'Scroll direction',
+  'web.input.scroll_normal': 'Normal',
+  'web.input.scroll_inverted': 'Inverted',
+  'web.input.scroll_help': 'Inverted is “natural” scrolling: the content follows your fingers.',
+  'web.input.note': 'Applied immediately. “Make permanent” writes input.lua so the settings survive a restart.',
+  'web.toast.input_applied': 'Keyboard and pointer settings applied.',
+  'web.toast.input_persisted': 'Keyboard and pointer written to %{path}.',
 };
 
 let i18nStrings = {};
@@ -169,6 +210,130 @@ el('btn-theme').addEventListener('click', () => {
   const next = THEME_ORDER[(THEME_ORDER.indexOf(storedTheme()) + 1) % THEME_ORDER.length];
   setTheme(next);
 });
+
+// --------------------------------------------------------- import/export --
+
+/**
+ * Downloads the whole configuration as a JSON file.
+ *
+ * Written out with indentation: an export is something a person opens, diffs
+ * and edits, not just something a machine reads back.
+ */
+el('btn-export').addEventListener('click', async () => {
+  try {
+    const bundle = await api('/api/config');
+    const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `hyprdmc-config-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    // Revoked on the next turn of the event loop: Chrome cancels the download
+    // if the object URL disappears before it has started reading it.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    toast(t('web.toast.exported', { name: link.download }));
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+el('btn-import').addEventListener('click', () => el('import-file').click());
+
+el('import-file').addEventListener('change', async (event) => {
+  const file = event.target.files?.[0];
+  // Reset straight away, so picking the same file twice in a row still fires.
+  event.target.value = '';
+  if (!file) return;
+
+  let bundle;
+  try {
+    bundle = JSON.parse(await file.text());
+  } catch (err) {
+    toast(t('web.toast.import_unreadable'), true);
+    return;
+  }
+
+  // Replacing every profile in one click deserves the one question.
+  const count = bundle?.config?.profile?.length ?? 0;
+  if (!confirm(t('web.import.confirm', { count }))) return;
+
+  try {
+    const res = await api('/api/config', { method: 'POST', body: JSON.stringify(bundle) });
+    toast(t('web.toast.imported', { count: res.profiles, path: res.path }));
+    await refresh();
+    await refreshInput();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+// ------------------------------------------------------------------ tabs --
+
+// The ARIA tabs pattern: one tab in the tab order at a time, arrows to move
+// between them. Switching hides a panel rather than rebuilding it, so an
+// unapplied arrangement survives a trip to the keyboard settings and back.
+const TABS = ['tab-screens', 'tab-input'];
+
+function selectTab(id, { moveFocus = true } = {}) {
+  for (const tabId of TABS) {
+    const tab = el(tabId);
+    const active = tabId === id;
+    tab.setAttribute('aria-selected', String(active));
+    tab.tabIndex = active ? 0 : -1;
+    el(tab.dataset.panel).hidden = !active;
+  }
+  el('actions-screens').hidden = id !== 'tab-screens';
+  el('actions-input').hidden = id !== 'tab-input';
+  if (moveFocus) el(id).focus();
+  // The canvas may have been hidden when it last tried to draw itself.
+  if (id === 'tab-screens') render();
+}
+
+for (const tabId of TABS) {
+  el(tabId).addEventListener('click', () => selectTab(tabId, { moveFocus: false }));
+  el(tabId).addEventListener('keydown', (event) => {
+    const step = { ArrowRight: 1, ArrowLeft: -1, Home: -TABS.length, End: TABS.length }[event.key];
+    if (step === undefined) return;
+    event.preventDefault();
+    const index = Math.min(Math.max(TABS.indexOf(tabId) + step, 0), TABS.length - 1);
+    selectTab(TABS[index]);
+  });
+}
+
+// ----------------------------------------------------------- history drawer --
+
+// The history is reference material — read now and then, never edited — so it
+// lives in a drawer instead of permanently costing the arrangement canvas a
+// third of its width. Closed by default; the choice is remembered.
+const HISTORY_KEY = 'hyprdmc.history';
+const drawer = () => el('history-panel');
+
+const historyOpen = () => document.body.classList.contains('history-open');
+
+/**
+ * Opens or closes the drawer.
+ *
+ * `inert` is what actually takes the closed drawer out of the tab order and
+ * out of the accessibility tree — the CSS `visibility` switch only handles the
+ * pointer. `moveFocus` is off during the initial restore, where stealing focus
+ * on page load would be rude.
+ */
+function setHistoryOpen(open, { moveFocus = true } = {}) {
+  document.body.classList.toggle('history-open', open);
+  if (open) drawer().removeAttribute('inert');
+  else drawer().setAttribute('inert', '');
+  el('btn-history').setAttribute('aria-expanded', String(open));
+  try {
+    localStorage.setItem(HISTORY_KEY, open ? 'open' : 'closed');
+  } catch (err) { /* localStorage unavailable: the choice just won't persist */ }
+  // Focus follows the panel in, and comes back to the button on the way out,
+  // so the keyboard never lands on nothing.
+  if (moveFocus) (open ? el('btn-history-close') : el('btn-history')).focus();
+}
+
+el('btn-history').addEventListener('click', () => setHistoryOpen(!historyOpen()));
+el('btn-history-close').addEventListener('click', () => setHistoryOpen(false));
+el('history-scrim').addEventListener('click', () => setHistoryOpen(false));
 
 // ------------------------------------------------------------------ model --
 
@@ -300,6 +465,27 @@ function render() {
   renderIssues();
   el('btn-apply').disabled = !dirty;
   el('btn-reset').disabled = !dirty;
+  renderPending();
+}
+
+/** How many outputs the draft would actually change. */
+function changedCount() {
+  const before = live?.layout?.outputs ?? [];
+  return draft.filter((o) => {
+    const was = before.find((p) => p.name === o.name);
+    return !was || JSON.stringify(was) !== JSON.stringify(o);
+  }).length;
+}
+
+/**
+ * Badges Apply with the number of outputs affected. An enabled button says
+ * "you may"; the count says "you have something to apply, and how much".
+ */
+function renderPending() {
+  const badge = el('pending');
+  const count = dirty ? changedCount() : 0;
+  badge.hidden = count === 0;
+  if (count) badge.textContent = t('web.action.pending', { count });
 }
 
 const degrees = (o) => Number(o.transform.rotation.slice(1));
@@ -577,9 +763,26 @@ function toast(message, isError = false) {
   toast.timer = setTimeout(() => { box.hidden = true; }, 6000);
 }
 
+/**
+ * Reconciles the draft with the outputs the daemon reports.
+ *
+ * A screen plugged in while you have unapplied changes has to show up anyway —
+ * otherwise the only way to see it is to throw your work away first. Edits are
+ * kept per output: an output already in the draft keeps the version being
+ * edited, one that just appeared is adopted from the live state, and one that
+ * vanished is dropped.
+ */
+function syncDraft(outputs) {
+  draft = outputs.map((o) => byName(o.name) ?? clone(o));
+  if (!byName(selected)) selected = draft[0]?.name ?? null;
+}
+
 function adopt(state) {
   live = state;
-  if (!dirty) {
+  if (dirty) {
+    syncDraft(state.layout.outputs);
+  } else {
+    // Nothing being edited: the live state wins outright, positions included.
     draft = clone(state.layout.outputs);
     if (!byName(selected)) selected = draft[0]?.name ?? null;
   }
@@ -593,23 +796,83 @@ function adopt(state) {
   refreshHistory();
 }
 
+/** Seconds left below which the guard switches to its urgent styling. */
+const GUARD_URGENT_AT = 5;
+/**
+ * Seconds at which the countdown is spoken. Announcing every tick would talk
+ * over the two buttons that resolve it; announcing only on open would leave a
+ * screen-reader user with no sense of the deadline.
+ */
+const GUARD_ANNOUNCE_AT = new Set([5, 3, 2, 1]);
+/** Matches `r` on the ring in index.html. */
+const GUARD_RING_RADIUS = 34;
+const GUARD_RING_LENGTH = 2 * Math.PI * GUARD_RING_RADIUS;
+
+/**
+ * Shows (or hides) the revert countdown, as a centred modal dialog.
+ *
+ * Modal on purpose: this is the one moment where the user may be facing a
+ * screen they cannot read, and nothing else on the page matters until they
+ * answer. `showModal()` brings the focus trap, the inert background and the
+ * top layer; focus then moves to "Keep" so the whole thing can be resolved
+ * with one key — Enter keeps, Escape reverts (see the `cancel` handler).
+ *
+ * The remaining time is stated three ways — a large number, a sentence, and a
+ * ring that drains — because a ring alone is not readable and a number alone
+ * is not noticeable.
+ */
 function showGuard(pending, seconds) {
   const guard = el('guard');
   clearInterval(guardTimer);
+
   if (!pending) {
-    guard.hidden = true;
+    if (guard.open) guard.close();
+    guard.classList.remove('urgent');
     return;
   }
-  guard.hidden = false;
+
+  const wasClosed = !guard.open;
+  // showModal() on an already-open dialog throws: every state push would land
+  // here, not just the one that opens it.
+  if (wasClosed) guard.showModal();
+
+  const total = Math.max(seconds, 1);
   let left = seconds;
+
+  const ring = el('guard-ring-bar');
+  ring.style.strokeDasharray = GUARD_RING_LENGTH;
+
   const tick = () => {
-    el('guard-text').textContent = t('web.guard.applied', { seconds: Math.max(left, 0) });
+    const shown = Math.max(left, 0);
+    el('guard-seconds').textContent = shown;
+    el('guard-countdown').textContent = t('web.guard.countdown', { seconds: shown });
+    ring.style.strokeDashoffset = GUARD_RING_LENGTH * (1 - shown / total);
+    guard.classList.toggle('urgent', shown <= GUARD_URGENT_AT);
+    // Read by assistive tech, which never sees the ring or the big digits.
+    if (shown === seconds || GUARD_ANNOUNCE_AT.has(shown)) {
+      el('guard-announce').textContent = t('web.guard.aria', { seconds: shown });
+    }
     if (left <= 0) clearInterval(guardTimer);
     left -= 1;
   };
+
   tick();
   guardTimer = setInterval(tick, 1000);
+
+  // Only on the transition into the guard: re-focusing on every state push
+  // would steal the caret while the user is already answering.
+  if (wasClosed) el('btn-confirm').focus();
 }
+
+/**
+ * Escape inside a <dialog> fires `cancel` and would just close it, leaving the
+ * layout applied and the countdown invisible. Here Escape means "revert" — the
+ * keyboard is the way out of a screen you cannot read.
+ */
+el('guard').addEventListener('cancel', (event) => {
+  event.preventDefault();
+  el('btn-revert').click();
+});
 
 function connect() {
   const source = new EventSource('/api/events');
@@ -650,6 +913,53 @@ el('btn-reset').addEventListener('click', () => {
   if (live) adopt(live);
 });
 
+/**
+ * Keyboard equivalents for the decisions that matter.
+ *
+ * Escape closes the history drawer; while the guard is up it reverts instead,
+ * but that is the dialog's own `cancel` event, which never reaches here.
+ * Ctrl/Cmd+Enter applies from anywhere, including mid-drag.
+ */
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && historyOpen()) {
+    event.preventDefault();
+    setHistoryOpen(false);
+    return;
+  }
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    const apply = el('btn-apply');
+    if (apply.disabled) return;
+    event.preventDefault();
+    apply.click();
+  }
+});
+
+/**
+ * Re-reads the outputs and says what changed.
+ *
+ * `GET /api/state` always queries Hyprland afresh, so this needs nothing new
+ * server-side — and it deliberately does *not* trigger a reconcile: reapplying
+ * the matching profile would move the screens already in place, which is not
+ * what "detect" means. The draft keeps its edits (see syncDraft), so a screen
+ * plugged in mid-arrangement joins the work in progress instead of erasing it.
+ */
+el('btn-rescan').addEventListener('click', async () => {
+  const button = el('btn-rescan');
+  const before = new Set((live?.monitors ?? []).map((m) => m.name));
+  button.disabled = true;
+  try {
+    adopt(await api('/api/state'));
+    const found = (live.monitors ?? []).map((m) => m.name).filter((name) => !before.has(name));
+    toast(found.length
+      ? t('web.toast.rescan_found', { names: found.join(', ') })
+      : t('web.toast.rescan_none'));
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 el('btn-auto').addEventListener('click', () => {
   let cursor = 0;
   for (const o of draft.filter(occupies)) {
@@ -660,18 +970,28 @@ el('btn-auto').addEventListener('click', () => {
   touch();
 });
 
-el('btn-confirm').addEventListener('click', async () => {
-  await api('/api/confirm', { method: 'POST' });
-  toast(t('web.toast.kept'));
-  await refresh();
-});
+/**
+ * Answers the guard. Both buttons go dead while the request is in flight —
+ * the dialog stays up until the daemon has actually decided, and a double
+ * click must not send the opposite answer twice.
+ */
+async function resolveGuard(path, message) {
+  const buttons = [el('btn-confirm'), el('btn-revert')];
+  for (const button of buttons) button.disabled = true;
+  try {
+    await api(path, { method: 'POST' });
+    dirty = false;
+    toast(message());
+    await refresh();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    for (const button of buttons) button.disabled = false;
+  }
+}
 
-el('btn-revert').addEventListener('click', async () => {
-  await api('/api/revert', { method: 'POST' });
-  dirty = false;
-  toast(t('web.toast.reverted'));
-  await refresh();
-});
+el('btn-confirm').addEventListener('click', () => resolveGuard('/api/confirm', () => t('web.toast.kept')));
+el('btn-revert').addEventListener('click', () => resolveGuard('/api/revert', () => t('web.toast.reverted')));
 
 el('btn-save').addEventListener('click', async () => {
   const name = prompt(t('web.prompt.profile_name'), live?.activeProfile ?? '');
@@ -725,9 +1045,15 @@ async function refreshHistory() {
 function renderHistory(data) {
   const list = el('history-list');
   const empty = el('history-empty');
-  const entries = (data.entries ?? []).slice(0, 5);
+  // The drawer scrolls, so it can afford more than the sidebar could.
+  const entries = (data.entries ?? []).slice(0, 10);
 
   el('history-remembered').textContent = t('web.history.remembered', { count: data.remembered ?? 0 });
+
+  // Closed, the drawer still has to say it holds something worth opening.
+  const count = el('history-count');
+  count.hidden = entries.length === 0;
+  count.textContent = entries.length;
 
   list.innerHTML = '';
   empty.hidden = entries.length > 0;
@@ -784,12 +1110,194 @@ function observeCanvas() {
   window.addEventListener('resize', () => render());
 }
 
+// --------------------------------------------------- keyboard and pointer --
+
+// Kept entirely apart from `draft`/`live`: the keyboard is not part of a
+// screen profile, and docking a laptop must never change what you type in.
+let inputCatalog = { layouts: [], variants: [], options: [] };
+let inputLive = null;     // last state read from the compositor
+let inputDraft = null;    // what the form currently says
+
+// Scroll direction: one segmented control per device, each bound to its own
+// field of the draft by `data-target`. Two Hyprland settings, two controls.
+const SCROLL_CONTROLS = ['scroll-touchpad', 'scroll-mouse'];
+
+const inputDirty = () => JSON.stringify(inputLive) !== JSON.stringify(inputDraft);
+
+/** Options are stored comma-separated; the UI works on the list. */
+const optionList = () => (inputDraft.kb_options ? inputDraft.kb_options.split(',').filter(Boolean) : []);
+
+function setOptionList(list) {
+  inputDraft.kb_options = list.join(',');
+  renderInput();
+}
+
+function fillSelect(select, entries, value, placeholder) {
+  select.innerHTML = '';
+  if (placeholder !== undefined) {
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = placeholder;
+    select.append(empty);
+  }
+  for (const entry of entries) {
+    const option = document.createElement('option');
+    option.value = entry.code;
+    // Code first: it is what ends up in the config file, and what the user
+    // will recognise if they have ever edited hyprland.lua by hand.
+    option.textContent = `${entry.code} — ${entry.label}`;
+    select.append(option);
+  }
+  select.value = value ?? '';
+  // A layout set by hand that the catalogue does not know about must still
+  // show, rather than silently snapping to the first entry in the list.
+  if (value && select.value !== value) {
+    const unknown = document.createElement('option');
+    unknown.value = value;
+    unknown.textContent = value;
+    select.append(unknown);
+    select.value = value;
+  }
+}
+
+function renderInput() {
+  if (!inputDraft) return;
+
+  fillSelect(el('kb-layout'), inputCatalog.layouts, inputDraft.kb_layout);
+
+  // Only the variants of the chosen layout: the full list is thousands of
+  // entries, and 99% of them are meaningless next to the current layout.
+  const variants = inputCatalog.variants.filter((v) => v.layout === inputDraft.kb_layout);
+  fillSelect(el('kb-variant'), variants, inputDraft.kb_variant, t('web.input.variant_none'));
+  el('kb-variant').disabled = variants.length === 0 && !inputDraft.kb_variant;
+
+  const chosen = optionList();
+  fillSelect(
+    el('kb-option-add'),
+    inputCatalog.options.filter((o) => !chosen.includes(o.code)),
+    '',
+    t('web.input.options_add'),
+  );
+
+  const list = el('kb-option-list');
+  list.innerHTML = '';
+  el('kb-options-empty').hidden = chosen.length > 0;
+  for (const code of chosen) {
+    const entry = inputCatalog.options.find((o) => o.code === code);
+    const item = document.createElement('li');
+    item.className = 'chip';
+    item.append(document.createTextNode(entry ? `${code} — ${entry.label}` : code));
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.setAttribute('aria-label', t('web.input.option_remove', { name: code }));
+    remove.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
+      + 'stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+    remove.addEventListener('click', () => setOptionList(chosen.filter((c) => c !== code)));
+    item.append(remove);
+    list.append(item);
+  }
+
+  for (const id of SCROLL_CONTROLS) {
+    const group = el(id);
+    const natural = inputDraft[group.dataset.target];
+    for (const button of group.querySelectorAll('button')) {
+      button.setAttribute('aria-pressed', String((button.dataset.natural === 'true') === natural));
+    }
+  }
+
+  el('btn-input-apply').disabled = !inputDirty();
+  el('btn-input-reset').disabled = !inputDirty();
+}
+
+el('kb-layout').addEventListener('change', (event) => {
+  inputDraft.kb_layout = event.target.value;
+  // A variant belongs to one layout: keeping "oss" after switching to "us"
+  // would send Hyprland a pair it will reject.
+  inputDraft.kb_variant = '';
+  renderInput();
+});
+
+el('kb-variant').addEventListener('change', (event) => {
+  inputDraft.kb_variant = event.target.value;
+  renderInput();
+});
+
+el('kb-option-add').addEventListener('change', (event) => {
+  if (!event.target.value) return;
+  setOptionList([...optionList(), event.target.value]);
+});
+
+for (const id of SCROLL_CONTROLS) {
+  el(id).addEventListener('click', (event) => {
+    const button = event.target.closest('button');
+    if (!button) return;
+    inputDraft[event.currentTarget.dataset.target] = button.dataset.natural === 'true';
+    renderInput();
+  });
+}
+
+/** Loads the live settings and the xkb catalogue. */
+async function refreshInput() {
+  try {
+    const data = await api('/api/input');
+    inputCatalog = data.catalog ?? inputCatalog;
+    inputLive = data.current;
+    // Never clobber an edit in progress with a background refresh.
+    if (!inputDraft || !inputDirty()) inputDraft = clone(inputLive);
+    renderInput();
+  } catch (err) {
+    console.error('input settings unavailable', err);
+  }
+}
+
+el('btn-input-apply').addEventListener('click', async () => {
+  const button = el('btn-input-apply');
+  button.disabled = true;
+  try {
+    await api('/api/input', { method: 'PUT', body: JSON.stringify(inputDraft) });
+    inputLive = clone(inputDraft);
+    toast(t('web.toast.input_applied'));
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    renderInput();
+  }
+});
+
+el('btn-input-reset').addEventListener('click', () => {
+  inputDraft = clone(inputLive);
+  renderInput();
+});
+
+el('btn-input-persist').addEventListener('click', async () => {
+  try {
+    const res = await api('/api/input/persist', { method: 'POST' });
+    toast(t('web.toast.input_persisted', { path: res.path }));
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+/** Restores the drawer's last state. Closed unless it was explicitly opened. */
+function restoreHistoryDrawer() {
+  let stored = 'closed';
+  try {
+    stored = localStorage.getItem(HISTORY_KEY) ?? 'closed';
+  } catch (err) { /* localStorage unavailable: start closed */ }
+  setHistoryOpen(stored === 'open', { moveFocus: false });
+}
+
 async function start() {
   await loadI18n();
   applyStaticI18n();
   updateThemeButton(storedTheme());
+  restoreHistoryDrawer();
   observeCanvas();
   await refresh();
+  // Not awaited: the arrangement is what the user came for, and the keyboard
+  // tab can populate a moment later without holding up the first paint.
+  refreshInput();
   connect();
 }
 

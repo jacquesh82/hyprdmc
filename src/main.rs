@@ -17,7 +17,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 use hyprdmc::apply::{self, ApplyReport};
 use hyprdmc::browser;
 use hyprdmc::cli::{Cli, Command, HistoryAction, ProfileAction, SafetyArgs, SetArgs, WebArgs};
-use hyprdmc::config::{Config, OutputRule, Profile, config_path, hyprland_conf, parse_position};
+use hyprdmc::config::{Config, OutputRule, Profile, config_path, hyprland_lua, parse_position};
 use hyprdmc::daemon::{self, AppState};
 use hyprdmc::emit;
 use hyprdmc::history::Store;
@@ -394,8 +394,8 @@ fn print_report(report: &ApplyReport) {
         eprintln!("{}: {}", severity_label(drift.severity), drift.message);
     }
     if report.succeeded() {
-        for spec in &report.specs {
-            println!("monitor = {spec}");
+        for call in &report.specs {
+            println!("{call}");
         }
     }
 }
@@ -556,35 +556,46 @@ fn cmd_persist() -> Result<()> {
     let cfg = Config::load()?;
     emit::persist(
         &Layout::from_monitors(&monitors),
-        &cfg.settings.monitors_conf,
+        &cfg.settings.monitors_lua,
     )?;
-    let path = cfg.settings.monitors_conf.display().to_string();
+    let path = cfg.settings.monitors_lua.display().to_string();
     println!("{}", t!("cli.persisted", path = path));
 
-    if !sources_monitors_conf(&hyprland_conf()) {
-        let path = hyprland_conf().display().to_string();
-        println!("{}", t!("cli.not_sourced", path = path));
+    if !requires_generated_file(&hyprland_lua(), &cfg.settings.monitors_lua) {
+        let path = hyprland_lua().display().to_string();
+        println!("{}", t!("cli.not_required", path = path));
     }
     Ok(())
 }
 
-fn sources_monitors_conf(hypr_conf: &std::path::Path) -> bool {
+/// Is `hyprland.lua` already pulling in the file we generate?
+fn requires_generated_file(hypr_conf: &std::path::Path, monitors_lua: &std::path::Path) -> bool {
+    let module = monitors_lua
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("monitors");
     std::fs::read_to_string(hypr_conf).is_ok_and(|c| {
         c.lines().any(|l| {
             let l = l.trim();
-            !l.starts_with('#') && l.starts_with("source") && l.contains("monitors.conf")
+            !l.starts_with("--")
+                && (l.contains("require(") || l.contains("dofile("))
+                && l.contains(module)
         })
     })
 }
 
 fn cmd_init(dry_run: bool) -> Result<()> {
     let cfg = Config::load()?;
-    let hypr_conf = hyprland_conf();
-    let report = emit::run_init(&hypr_conf, &cfg.settings.monitors_conf, dry_run)?;
+    let hypr_conf = hyprland_lua();
+    let report = emit::run_init_all(
+        &hypr_conf,
+        &[&cfg.settings.monitors_lua, &cfg.settings.input_lua],
+        dry_run,
+    )?;
 
     if report.already_wired {
         let conf = hypr_conf.display().to_string();
-        let target = cfg.settings.monitors_conf.display().to_string();
+        let target = cfg.settings.monitors_lua.display().to_string();
         println!(
             "{}",
             t!("cli.init.already_wired", conf = conf, target = target)
@@ -607,22 +618,30 @@ fn cmd_init(dry_run: bool) -> Result<()> {
         "{}",
         t!(
             "cli.init.source_added",
-            path = emit::tildify(&cfg.settings.monitors_conf)
+            statement = emit::require_statement(&hypr_conf, &cfg.settings.monitors_lua)
         )
     );
     if !report.adopted.is_empty() {
         println!("{}", t!("cli.init.adopted", count = report.adopted.len()));
     }
 
-    // The current layout is written right away: on the next reload, the
-    // display must stay exactly as it is now.
-    let monitors = backend()?.monitors()?;
+    // The current state is written right away: on the next reload, the
+    // display and the keyboard must stay exactly as they are now.
+    let hypr = backend()?;
+    let monitors = hypr.monitors()?;
     emit::persist(
         &Layout::from_monitors(&monitors),
-        &cfg.settings.monitors_conf,
+        &cfg.settings.monitors_lua,
     )?;
-    let path = cfg.settings.monitors_conf.display().to_string();
+    let path = cfg.settings.monitors_lua.display().to_string();
     println!("{}", t!("cli.persisted", path = path));
+
+    emit::persist_input(
+        &hyprdmc::input::InputConfig::read(&hypr)?,
+        &cfg.settings.input_lua,
+    )?;
+    let input_path = cfg.settings.input_lua.display().to_string();
+    println!("{}", t!("cli.persisted", path = input_path));
     println!("{}", t!("cli.init.reload_hint"));
     Ok(())
 }

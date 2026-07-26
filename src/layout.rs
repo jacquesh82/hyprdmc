@@ -101,34 +101,56 @@ impl OutputState {
         self.enabled && self.mirror_of.is_none()
     }
 
-    /// Renders the corresponding Hyprland directive (the part after `monitor = `).
-    pub fn to_spec(&self) -> String {
+    /// Renders the `hl.monitor{…}` call that configures this output.
+    ///
+    /// Hyprland's Lua rules are cumulative: a field left out keeps whatever
+    /// an earlier call gave it. Every field we own is therefore always
+    /// written out, otherwise a mirror or a rotation would survive its own
+    /// removal.
+    pub fn to_lua(&self) -> String {
         if !self.enabled {
-            return format!("{},disable", self.name);
+            return format!(
+                "hl.monitor({{ output = {}, disabled = true }})",
+                lua_string(&self.name)
+            );
         }
         let mode = match self.mode {
             Some(m) => m.to_string(),
             None => "preferred".to_string(),
         };
-        let mut spec = format!(
-            "{},{},{}x{},{}",
-            self.name,
-            mode,
+        format!(
+            "hl.monitor({{ output = {}, mode = {}, position = \"{}x{}\", \
+             scale = {}, transform = {}, mirror = {}, vrr = {}, disabled = false }})",
+            lua_string(&self.name),
+            lua_string(&mode),
             self.x,
             self.y,
-            format_scale(self.scale)
-        );
-        if self.transform.to_u8() != 0 {
-            spec.push_str(&format!(",transform,{}", self.transform.to_u8()));
-        }
-        if let Some(target) = &self.mirror_of {
-            spec.push_str(&format!(",mirror,{target}"));
-        }
-        if self.vrr {
-            spec.push_str(",vrr,1");
-        }
-        spec
+            format_scale(self.scale),
+            self.transform.to_u8(),
+            lua_string(self.mirror_of.as_deref().unwrap_or("")),
+            u8::from(self.vrr),
+        )
     }
+}
+
+/// Quotes a value as a Lua string literal.
+///
+/// Output names come from the compositor and profile rules come from the
+/// user: neither is trusted to be free of quotes or backslashes.
+pub fn lua_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Formats a scale without trailing noise: `1`, `1.5`, `1.333333`.
@@ -205,8 +227,8 @@ impl Layout {
     }
 
     /// Hyprland directives for the entire layout.
-    pub fn to_specs(&self) -> Vec<String> {
-        self.outputs.iter().map(OutputState::to_spec).collect()
+    pub fn to_lua_calls(&self) -> Vec<String> {
+        self.outputs.iter().map(OutputState::to_lua).collect()
     }
 
     pub fn has_errors(&self) -> bool {
@@ -521,29 +543,54 @@ mod tests {
     }
 
     #[test]
-    fn spec_omits_default_extras() {
+    fn lua_call_always_states_every_field_it_owns() {
+        // Cumulative rules: omitting a field would let the previous value
+        // survive, so defaults are spelled out too.
         let o = out("eDP-1", 1920, 1080, 0, 0);
-        assert_eq!(o.to_spec(), "eDP-1,1920x1080@60.00,0x0,1");
+        assert_eq!(
+            o.to_lua(),
+            "hl.monitor({ output = \"eDP-1\", mode = \"1920x1080@60.00\", position = \"0x0\", \
+             scale = 1, transform = 0, mirror = \"\", vrr = 0, disabled = false })"
+        );
     }
 
     #[test]
-    fn spec_includes_transform_mirror_and_vrr() {
+    fn lua_call_carries_transform_mirror_and_vrr() {
         let mut o = out("DP-1", 1920, 1080, 1920, 0);
         o.transform = Transform::new(Rotation::R90, true);
         o.mirror_of = Some("eDP-1".into());
         o.vrr = true;
         o.scale = 1.25;
         assert_eq!(
-            o.to_spec(),
-            "DP-1,1920x1080@60.00,1920x0,1.25,transform,5,mirror,eDP-1,vrr,1"
+            o.to_lua(),
+            "hl.monitor({ output = \"DP-1\", mode = \"1920x1080@60.00\", position = \"1920x0\", \
+             scale = 1.25, transform = 5, mirror = \"eDP-1\", vrr = 1, disabled = false })"
         );
     }
 
     #[test]
-    fn disabled_output_spec_is_just_disable() {
+    fn disabled_output_only_states_that_it_is_off() {
         let mut o = out("eDP-1", 1920, 1080, 0, 0);
         o.enabled = false;
-        assert_eq!(o.to_spec(), "eDP-1,disable");
+        assert_eq!(
+            o.to_lua(),
+            "hl.monitor({ output = \"eDP-1\", disabled = true })"
+        );
+    }
+
+    #[test]
+    fn lua_strings_escape_quotes_and_backslashes() {
+        assert_eq!(
+            lua_string(r#"desc:Acme "X" \ 1"#),
+            r#""desc:Acme \"X\" \\ 1""#
+        );
+    }
+
+    #[test]
+    fn output_without_a_mode_falls_back_to_preferred() {
+        let mut o = out("eDP-1", 1920, 1080, 0, 0);
+        o.mode = None;
+        assert!(o.to_lua().contains("mode = \"preferred\""));
     }
 
     #[test]

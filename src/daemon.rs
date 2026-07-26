@@ -84,6 +84,12 @@ impl Origin {
 struct PendingRevert {
     /// Last confirmed state, to revert to.
     previous: Layout,
+    /// State awaiting confirmation. Kept here so that [`AppState::confirm`]
+    /// knows what to file in the history: a layout only earns its place there
+    /// once the user has said they can still see their screens.
+    applied: Layout,
+    /// Named profile this layout came from, if any.
+    profile: Option<String>,
     timer: JoinHandle<()>,
 }
 
@@ -124,11 +130,17 @@ impl AppState {
 
     /// Applies a layout, then arms the automatic revert if the user has
     /// left the safety net active.
+    ///
+    /// `profile` names the profile the layout came from, for the history;
+    /// `None` means it was arranged by hand. Filing happens here (firm apply)
+    /// or on confirmation (guarded apply) — never at both, and never for a
+    /// layout Hyprland rolled back.
     pub async fn apply(
         self: &Arc<Self>,
         layout: Layout,
         force: bool,
         guard: bool,
+        profile: Option<String>,
     ) -> Result<ApplyReport> {
         let backend = Arc::clone(&self.backend);
         let previous = {
@@ -143,10 +155,12 @@ impl AppState {
 
         let timeout = Duration::from_secs(self.config.read().await.settings.confirm_timeout_secs);
         if guard && report.succeeded() && !timeout.is_zero() {
-            self.arm_revert(previous, timeout).await;
+            self.arm_revert(previous, layout, profile, timeout).await;
         } else if report.succeeded() {
-            // A firm apply: the current state becomes the new reference.
+            // A firm apply: nobody will confirm it, so it is the new reference
+            // and it goes into the history right away.
             self.cancel_revert().await;
+            self.remember(&layout, profile.as_deref()).await;
         }
 
         self.broadcast().await;
@@ -156,7 +170,13 @@ impl AppState {
     /// Schedules the revert. If a revert was already armed, we keep **its**
     /// reference state: the last one confirmed by the user, not some
     /// intermediate state that was never validated.
-    async fn arm_revert(self: &Arc<Self>, previous: Layout, timeout: Duration) {
+    async fn arm_revert(
+        self: &Arc<Self>,
+        previous: Layout,
+        applied: Layout,
+        profile: Option<String>,
+        timeout: Duration,
+    ) {
         let mut slot = self.pending.lock().await;
         let previous = match slot.take() {
             Some(old) => {
@@ -179,12 +199,28 @@ impl AppState {
             state.broadcast().await;
         });
 
-        *slot = Some(PendingRevert { previous, timer });
+        *slot = Some(PendingRevert {
+            previous,
+            applied,
+            profile,
+            timer,
+        });
     }
 
-    /// Confirms the current configuration: the revert is disarmed.
+    /// Confirms the current configuration: the revert is disarmed, and the
+    /// layout is filed in the history.
+    ///
+    /// Filing happens *here* rather than at apply time on purpose — the
+    /// history is an undo list, and an arrangement the user rejected (or never
+    /// answered for, and which reverted on its own) has no business in it.
     pub async fn confirm(&self) -> bool {
-        self.cancel_revert().await
+        let Some(pending) = self.pending.lock().await.take() else {
+            return false;
+        };
+        pending.timer.abort();
+        self.remember(&pending.applied, pending.profile.as_deref())
+            .await;
+        true
     }
 
     async fn cancel_revert(&self) -> bool {
@@ -224,10 +260,15 @@ impl AppState {
         let origin = self.choose(&monitors).await?;
         tracing::info!("{}", origin.describe());
 
-        // A firm apply: nobody is around to confirm a hotplug event.
-        self.apply(origin.layout().clone(), false, false).await?;
-        self.remember(&monitors, origin.layout(), origin.profile())
-            .await;
+        // A firm apply: nobody is around to confirm a hotplug event. It files
+        // itself in the history — but only if Hyprland kept it.
+        self.apply(
+            origin.layout().clone(),
+            false,
+            false,
+            origin.profile().map(str::to_string),
+        )
+        .await?;
         Ok(origin)
     }
 
@@ -266,10 +307,17 @@ impl AppState {
     }
 
     /// Files a layout in the history and the recall map.
-    async fn remember(&self, monitors: &[Monitor], layout: &Layout, profile: Option<&str>) {
+    ///
+    /// Best-effort, like its CLI counterpart: failing to record must not turn
+    /// a successful apply into an error, so problems are logged and swallowed.
+    async fn remember(&self, layout: &Layout, profile: Option<&str>) {
+        let Ok(monitors) = self.monitors().await else {
+            tracing::warn!("outputs unreadable: layout not filed in the history");
+            return;
+        };
         let snapshot = Snapshot::new(
             layout.clone(),
-            signature(monitors),
+            signature(&monitors),
             profile.map(str::to_string),
         );
         let mut store = self.store.lock().await;
@@ -288,7 +336,13 @@ impl AppState {
             .entry(index)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no history entry at position {index}"))?;
-        self.apply(snapshot.layout.clone(), false, true).await?;
+        self.apply(
+            snapshot.layout.clone(),
+            false,
+            true,
+            snapshot.profile.clone(),
+        )
+        .await?;
         Ok(snapshot)
     }
 
@@ -516,7 +570,7 @@ mod tests {
 
         let monitors = state.monitors().await.unwrap();
         let layout = Layout::from_monitors(&monitors);
-        state.apply(layout, false, true).await.unwrap();
+        state.apply(layout, false, true, None).await.unwrap();
 
         assert!(state.revert_pending().await);
         assert!(state.confirm().await);
@@ -529,7 +583,7 @@ mod tests {
         cfg.settings.confirm_timeout_secs = 60;
         let state = state_with(&json_two_screens(), cfg);
         let layout = Layout::from_monitors(&state.monitors().await.unwrap());
-        state.apply(layout, false, false).await.unwrap();
+        state.apply(layout, false, false, None).await.unwrap();
         assert!(!state.revert_pending().await);
     }
 
@@ -540,8 +594,14 @@ mod tests {
         let state = state_with(&json_two_screens(), cfg);
 
         let original = Layout::from_monitors(&state.monitors().await.unwrap());
-        state.apply(original.clone(), false, true).await.unwrap();
-        state.apply(original.clone(), false, true).await.unwrap();
+        state
+            .apply(original.clone(), false, true, None)
+            .await
+            .unwrap();
+        state
+            .apply(original.clone(), false, true, None)
+            .await
+            .unwrap();
 
         // The revert point stays the first one, never an intermediate state.
         let pending = state.pending.lock().await;
@@ -554,7 +614,7 @@ mod tests {
         cfg.settings.confirm_timeout_secs = 60;
         let state = state_with(&json_two_screens(), cfg);
         let layout = Layout::from_monitors(&state.monitors().await.unwrap());
-        state.apply(layout, false, true).await.unwrap();
+        state.apply(layout, false, true, None).await.unwrap();
 
         assert!(state.revert_now().await.unwrap());
         assert!(!state.revert_pending().await);
@@ -568,7 +628,7 @@ mod tests {
         cfg.settings.confirm_timeout_secs = 1;
         let state = state_with(&json_two_screens(), cfg);
         let layout = Layout::from_monitors(&state.monitors().await.unwrap());
-        state.apply(layout, false, true).await.unwrap();
+        state.apply(layout, false, true, None).await.unwrap();
         assert!(state.revert_pending().await);
 
         tokio::time::sleep(Duration::from_millis(1300)).await;
@@ -744,5 +804,88 @@ mod recall_tests {
         let restored = state.restore(0).await.unwrap();
         assert_eq!(restored.layout, layout);
         assert!(state.restore(9).await.is_err());
+    }
+
+    /// The web UI is the main user of the guarded path: what it applies has to
+    /// end up in the history like anything the CLI applies, or "restore the
+    /// previous arrangement" silently ignores everything done with the mouse.
+    #[tokio::test]
+    async fn a_guarded_apply_is_filed_once_confirmed() {
+        let mut cfg = Config::default();
+        cfg.settings.confirm_timeout_secs = 60;
+        let state = state(Store::ephemeral(), cfg);
+
+        // The layout the fake backend already reports: anything else reads back
+        // as drift and gets rolled back, which is a different test.
+        let applied = Layout::from_monitors(&state.monitors().await.unwrap());
+        state
+            .apply(applied.clone(), false, true, None)
+            .await
+            .unwrap();
+
+        assert!(
+            state.store.lock().await.history.is_empty(),
+            "an unconfirmed layout is not history yet"
+        );
+
+        assert!(state.confirm().await);
+        let store = state.store.lock().await;
+        assert_eq!(store.history.len(), 1);
+        assert_eq!(store.history[0].layout, applied);
+        // The recall map too: this is what makes redocking reuse it.
+        assert_eq!(store.recall.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reverted_layout_never_reaches_the_history() {
+        let mut cfg = Config::default();
+        cfg.settings.confirm_timeout_secs = 60;
+        let state = state(Store::ephemeral(), cfg);
+
+        // The layout the fake backend already reports: anything else reads back
+        // as drift and gets rolled back, which is a different test.
+        let applied = Layout::from_monitors(&state.monitors().await.unwrap());
+        state.apply(applied, false, true, None).await.unwrap();
+        assert!(state.revert_now().await.unwrap());
+
+        assert!(
+            state.store.lock().await.history.is_empty(),
+            "an arrangement the user rejected has no business in an undo list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guard_left_to_expire_files_nothing() {
+        let mut cfg = Config::default();
+        cfg.settings.confirm_timeout_secs = 1;
+        let state = state(Store::ephemeral(), cfg);
+
+        // The layout the fake backend already reports: anything else reads back
+        // as drift and gets rolled back, which is a different test.
+        let applied = Layout::from_monitors(&state.monitors().await.unwrap());
+        state.apply(applied, false, true, None).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(!state.revert_pending().await);
+        assert!(
+            state.store.lock().await.history.is_empty(),
+            "no answer means no, and no is not history"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unguarded_apply_is_filed_straight_away() {
+        let state = state(Store::ephemeral(), Config::default());
+        // The layout the fake backend already reports: anything else reads back
+        // as drift and gets rolled back, which is a different test.
+        let applied = Layout::from_monitors(&state.monitors().await.unwrap());
+        state
+            .apply(applied.clone(), false, false, None)
+            .await
+            .unwrap();
+
+        let store = state.store.lock().await;
+        assert_eq!(store.history.len(), 1);
+        assert_eq!(store.history[0].layout, applied);
     }
 }

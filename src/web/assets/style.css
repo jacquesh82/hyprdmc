@@ -25,8 +25,23 @@
   --mirror: #b394f0;
   --shadow-soft: rgba(0, 0, 0, .22);
   --shadow-strong: rgba(0, 0, 0, .4);
+  --scrim: rgba(0, 0, 0, .55);
   --sheen: rgba(255, 255, 255, .05);
   --radius: 8px;
+
+  /* One layering scale, declared once, so nothing has to guess a z-index.
+     The guard is a top-layer <dialog>: it outranks all of these by
+     construction, which is exactly why it is not listed here. */
+  --z-dock: 40;
+  --z-scrim: 45;
+  --z-drawer: 50;
+  --z-toast: 60;
+  /* Minimum comfortable hit area. */
+  --tap: 2.25rem;
+  /* Column widths, named once: the drawer's width is also the padding the
+     body reserves for it on wide screens, and the two must not drift. */
+  --panel-w: 19rem;
+  --drawer-w: 21rem;
 }
 
 @media (prefers-color-scheme: light) {
@@ -46,6 +61,7 @@
     --mirror: #7c4fd1;
     --shadow-soft: rgba(30, 41, 59, .1);
     --shadow-strong: rgba(30, 41, 59, .2);
+    --scrim: rgba(15, 23, 42, .45);
     --sheen: rgba(255, 255, 255, .65);
   }
 }
@@ -66,6 +82,7 @@
   --mirror: #b394f0;
   --shadow-soft: rgba(0, 0, 0, .22);
   --shadow-strong: rgba(0, 0, 0, .4);
+  --scrim: rgba(0, 0, 0, .55);
   --sheen: rgba(255, 255, 255, .05);
 }
 
@@ -85,19 +102,53 @@
   --mirror: #7c4fd1;
   --shadow-soft: rgba(30, 41, 59, .1);
   --shadow-strong: rgba(30, 41, 59, .2);
+  --scrim: rgba(15, 23, 42, .45);
   --sheen: rgba(255, 255, 255, .65);
 }
 
 * { box-sizing: border-box; }
 
+/* `hidden` has to beat every `display` declared below.
+ *
+ * The browser's own `[hidden] { display: none }` lives in the user-agent
+ * stylesheet, and *any* author rule outranks it — origin comes before
+ * specificity in the cascade. So `main { display: grid }` alone was enough to
+ * keep a hidden tab panel on screen. Declaring it here, as the author, puts it
+ * back in charge; `!important` covers the components that set their own
+ * display later in the file.
+ */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
-  min-height: 100vh;
+  /* `dvh`, not `vh`: on mobile the viewport shrinks under the URL bar, and
+     `100vh` would push the dock permanently below the fold. */
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
   background: var(--bg);
   color: var(--text);
   font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* On wide screens the drawer sits beside the content rather than over it: the
+   body reserves its width so nothing is ever hidden behind it. Not animated —
+   padding is a layout property, and reflowing it at 60 fps to accompany a
+   slide-in is not worth the jank. */
+@media (min-width: 60rem) {
+  body.history-open { padding-right: var(--drawer-w); }
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 header, footer {
@@ -107,6 +158,15 @@ header, footer {
   padding: .7rem 1rem;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+}
+
+/* The header outranks the content it sits above and stays reachable while the
+   canvas scrolls: the history toggle and the connection dot are status, and
+   status you have to scroll back to is status you stop checking. */
+header {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-dock);
 }
 
 footer {
@@ -135,6 +195,38 @@ h1 { font-size: 1.05rem; margin: 0; letter-spacing: .02em; }
   min-width: 3.4rem;
 }
 
+/* Icon + label, never icon alone: an unlabelled glyph in a toolbar is a
+   guessing game. The label collapses on narrow screens, where the button
+   keeps its `aria-label` and its full hit area. */
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  min-height: var(--tap);
+  padding: .3rem .7rem;
+  border-radius: 99px;
+  font-size: .8rem;
+}
+.icon-button svg { width: 1.05rem; height: 1.05rem; flex-shrink: 0; }
+.icon-button.icon-only { padding: .3rem; min-width: var(--tap); justify-content: center; }
+.icon-button[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface-2));
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+/* Number of remembered layouts, on the button that reveals them. */
+.count {
+  min-width: 1.25rem;
+  padding: 0 .3rem;
+  border-radius: 99px;
+  background: var(--surface-2-hi);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: .7rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
 .dot {
   width: .6rem;
   height: .6rem;
@@ -144,21 +236,67 @@ h1 { font-size: 1.05rem; margin: 0; letter-spacing: .02em; }
 }
 .dot.live { background: var(--ok); }
 
-main {
-  flex: 1;
+/* ----------------------------------------------------------------- tabs -- */
+
+.tabs {
   display: flex;
-  gap: 1rem;
-  padding: 1rem;
-  align-items: flex-start;
-  flex-wrap: wrap;
+  gap: .25rem;
+  padding: 0 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
 }
 
-.stage { flex: 1 1 480px; min-width: 0; }
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: .45rem;
+  min-height: var(--tap);
+  padding: .5rem .9rem;
+  background: none;
+  border: none;
+  /* The indicator is a border on the tab itself, so the selected state does
+     not depend on colour alone — it has a different shape. */
+  border-bottom: 2px solid transparent;
+  border-radius: 6px 6px 0 0;
+  color: var(--muted);
+  font-weight: 500;
+}
+.tab svg { width: 1.05rem; height: 1.05rem; flex-shrink: 0; }
+.tab:hover:not([aria-selected="true"]) { color: var(--text); background: var(--surface-2); }
+.tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
+/* Two columns: the arrangement canvas takes everything the settings panel does
+   not need. `minmax(0, 1fr)` rather than `1fr` so a long output name cannot
+   force the column wider than the viewport. */
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--panel-w);
+  gap: 1rem;
+  padding: 1rem;
+  min-height: 0;
+}
+
+@media (max-width: 60rem) {
+  main { grid-template-columns: minmax(0, 1fr); }
+}
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Fills the column instead of claiming a fixed 60vh: the canvas is the whole
+   point of the page, so it gets whatever the header, hint and dock leave. */
 .canvas {
   position: relative;
-  height: 60vh;
-  min-height: 320px;
+  flex: 1;
+  min-height: 20rem;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -222,32 +360,204 @@ main {
 
 .hint { color: var(--muted); font-size: .82rem; margin: .5rem 0 0; }
 
-.side {
-  flex: 0 1 300px;
-  min-width: 260px;
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-}
-
-.panel, .history {
+/* Sticks under the header while the canvas scrolls, and stops short of
+   stretching to the full column height when it only holds one line. */
+.panel {
+  align-self: start;
+  position: sticky;
+  top: 4.5rem;
+  max-height: calc(100dvh - 6rem);
+  overflow-y: auto;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 1rem;
 }
-.panel .empty, .history .empty { color: var(--muted); margin: 0; font-size: .85rem; }
+@media (max-width: 60rem) {
+  .panel { position: static; max-height: none; }
+}
+
+/* ------------------------------------------------------- keyboard/pointer -- */
+
+/* Two columns when they fit, one when they don't — decided by the grid itself
+   rather than by a breakpoint.
+ *
+ * `auto-fit` + `minmax` measures the space actually available, so opening the
+ * history drawer (which takes 21rem off the body) collapses the page back to a
+ * single column on its own; a `min-width` media query would have had to guess
+ * the drawer's width and would be wrong every time that width changes.
+ * `min(100%, 22rem)` keeps the track from overflowing a narrow viewport, where
+ * 22rem is wider than the screen. */
+.input-page {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  align-content: start;
+  gap: 1rem;
+  max-width: 56rem;
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* Full width whatever the column count: it comments on the page, not on the
+   card it happens to sit under. */
+.input-page .page-note { grid-column: 1 / -1; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+}
+.card h2 { font-size: .95rem; margin: 0 0 .9rem; }
+
+/* Persistent, below the control it explains — a placeholder disappears the
+   moment it is most needed. */
+.helper { color: var(--muted); font-size: .78rem; margin: .3rem 0 0; }
+.page-note { text-align: center; margin: 0 0 .5rem; }
+
+/* A real fieldset/legend: one setting that applies to several devices is a
+   group, and saying so is what makes a screen reader announce "Scroll
+   direction, Touchpad" instead of a bare "Touchpad". */
+.group {
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+.group legend {
+  padding: 0;
+  margin-bottom: .6rem;
+  font-size: .78rem;
+  color: var(--muted);
+}
+
+/* Device rows: the label sits beside its control rather than above it, so the
+   two devices read as one comparable pair. */
+/* `.field.device` rather than `.device`: the generic `.field` rules live
+   further down this file and would win the tie on source order. */
+.field.device {
+  display: flex;
+  align-items: center;
+  gap: .75rem;
+  margin-bottom: .6rem;
+}
+.field.device > label { flex: 1; margin: 0; font-size: .85rem; color: var(--text); }
+.field.device .segmented { flex: 0 0 auto; }
+.field.device .segmented button { padding: .35rem .8rem; }
+
+/* Narrow: stack the label above its control rather than squeezing both. */
+@media (max-width: 26rem) {
+  .field.device { flex-direction: column; align-items: stretch; gap: .3rem; }
+  .field.device .segmented { flex: 1; }
+}
+
+/* Selected keyboard options. Each chip carries its own remove button rather
+   than relying on re-picking in the list to toggle. */
+.chips {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+  margin: .5rem 0 0;
+  padding: 0;
+}
+.chips:empty { margin: 0; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .2rem .3rem .2rem .6rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  font-size: .78rem;
+}
+/* Small glyph, full-size target: the × is 0.8rem but the button keeps the
+   same minimum hit area as every other control on the page. */
+.chip button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--tap);
+  height: var(--tap);
+  padding: 0;
+  border-radius: 50%;
+  background: none;
+  border: none;
+  color: var(--muted);
+  line-height: 1;
+}
+.chip button:hover { color: var(--danger); background: var(--surface-2-hi); }
+.chip button svg { width: .8rem; height: .8rem; }
+
+.panel .empty, .drawer .empty { color: var(--muted); margin: 0; font-size: .85rem; }
 .panel h2 { font-size: .95rem; margin: 0 0 .2rem; }
 .panel .sub { color: var(--muted); font-size: .8rem; margin: 0 0 1rem; word-break: break-word; }
 
-.history-head {
+/* --------------------------------------------------------------- drawer -- */
+
+/* Off-canvas, full height, anchored right. `visibility` is transitioned (not
+   just the transform) so a closed drawer is neither clickable nor a scroll
+   target once it has slid away; `inert` (set in app.js) does the same for the
+   keyboard and for assistive tech. */
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: var(--z-drawer);
+  width: min(var(--drawer-w), 100vw);
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: .5rem;
-  margin-bottom: .6rem;
+  flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: -12px 0 32px -18px var(--shadow-strong);
+  transform: translateX(100%);
+  visibility: hidden;
+  transition: transform .22s ease-in, visibility 0s linear .22s;
 }
-.history-head h2 { font-size: .95rem; margin: 0; }
+body.history-open .drawer {
+  transform: translateX(0);
+  visibility: visible;
+  /* Enter is the slower half of the pair (ease-out, in); exit snaps back. */
+  transition: transform .26s ease-out, visibility 0s;
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .7rem .9rem;
+  border-bottom: 1px solid var(--border);
+}
+.drawer-head h2 { font-size: .95rem; margin: 0; }
+.drawer-head .muted { flex: 1; }
+
+.drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: .9rem;
+}
+
+/* Only meaningful where the drawer overlays the content; above 60rem the body
+   makes room for it and there is nothing to dim. */
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-scrim);
+  background: var(--scrim);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .2s ease, visibility 0s linear .2s;
+}
+@media (max-width: 60rem) {
+  body.history-open .scrim {
+    opacity: 1;
+    visibility: visible;
+    transition: opacity .2s ease, visibility 0s;
+  }
+}
+
 .muted { color: var(--muted); font-size: .75rem; }
 
 .history-list {
@@ -275,7 +585,7 @@ main {
   color: var(--muted);
 }
 .history-summary { font-size: .78rem; word-break: break-word; }
-.history-entry button { align-self: flex-start; padding: .25rem .6rem; font-size: .78rem; }
+.history-entry button { align-self: flex-start; min-height: var(--tap); padding: .25rem .7rem; font-size: .78rem; }
 
 .field { margin-bottom: .85rem; }
 .field > label { display: block; font-size: .78rem; color: var(--muted); margin-bottom: .25rem; }
@@ -319,7 +629,27 @@ button {
 button:hover:not(:disabled) { border-color: var(--muted); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-button.danger { color: var(--danger); }
+button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+button.danger:hover:not(:disabled) { border-color: var(--danger); }
+
+/* Keyboard users get the same affordance the mouse gets, and then some: the
+   ring is drawn outside the button so it stays visible on the accent fill. */
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+button.primary:focus-visible,
+button.danger:focus-visible {
+  outline-color: var(--text);
+}
+
+/* The one call to action on the page. Bigger than its neighbours on purpose:
+   size is what makes it findable, the accent alone is not enough. */
+.cta {
+  min-height: var(--tap);
+  padding: .45rem 1.1rem;
+  font-weight: 600;
+}
 
 .issues {
   margin: 0 1rem;
@@ -333,22 +663,160 @@ button.danger { color: var(--danger); }
 .issues .error { color: var(--danger); }
 .issues .warning { color: var(--warn); }
 
-.guard {
+/* ----------------------------------------------------------------- dock -- */
+
+/* Sticky rather than fixed: it keeps its place in the flow, so a long page
+   never hides its own action bar behind the fold. */
+.dock {
+  position: sticky;
+  bottom: 0;
+  z-index: var(--z-dock);
+}
+
+footer {
+  gap: .5rem;
+  /* The dock floats over the content it covers; a shadow above it says so. */
+  box-shadow: 0 -6px 16px -10px var(--shadow-strong);
+}
+
+.actions-primary,
+.actions-secondary {
   display: flex;
   align-items: center;
-  gap: .6rem;
-  margin: 1rem 1rem 0;
-  padding: .6rem .8rem;
-  border-radius: var(--radius);
-  border: 1px solid var(--warn);
-  background: color-mix(in srgb, var(--warn) 12%, var(--surface));
+  gap: .5rem;
+  flex-wrap: wrap;
 }
-.guard span { flex: 1; }
+
+/* How many outputs the draft changes. Attached to Apply because the count is
+   the reason to press it. */
+.pending {
+  padding: .1rem .5rem;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface-2));
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--text);
+  font-size: .75rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- guard -- */
+
+/* A centred modal <dialog>: the top layer puts it above everything without a
+   z-index, and the UA centres it. The element itself is only a wrapper — the
+   visible card is inside, so its entrance can be animated independently of
+   the backdrop. */
+.guard {
+  margin: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  max-width: min(24rem, calc(100vw - 2rem));
+  overflow: visible;
+}
+.guard::backdrop {
+  /* Blur says "the thing behind is dismissed for now" — the one job blur has
+     here; it is not decoration. */
+  background: var(--scrim);
+  backdrop-filter: blur(2px);
+}
+
+.guard-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: .35rem;
+  padding: 1.5rem 1.4rem 1.2rem;
+  text-align: center;
+  background: var(--surface);
+  border: 1px solid var(--warn);
+  border-radius: calc(var(--radius) * 1.5);
+  box-shadow: 0 24px 60px -20px var(--shadow-strong);
+  transition: border-color .2s ease;
+  animation: guard-in .2s ease-out both;
+}
+
+@keyframes guard-in {
+  from { opacity: 0; transform: scale(.94) translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* The seconds are the whole point, so they get the largest type on screen,
+   inside a ring that drains — a number alone is not noticeable, a ring alone
+   is not readable. Tabular figures: 10 → 9 must not shift the layout. */
+.guard-clock {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: .08rem;
+  width: 6.5rem;
+  height: 6.5rem;
+  margin-bottom: .4rem;
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+  transition: color .2s ease;
+}
+.guard-ring {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  /* Drains from 12 o'clock, clockwise. */
+  transform: rotate(-90deg);
+}
+.guard-ring-track {
+  fill: none;
+  stroke: color-mix(in srgb, var(--warn) 22%, transparent);
+  stroke-width: 5;
+}
+.guard-ring-bar {
+  fill: none;
+  stroke: var(--warn);
+  stroke-width: 5;
+  stroke-linecap: round;
+  /* Matches the 1 s tick that sets the offset, so the drain looks continuous
+     instead of stepping. Neither property triggers layout. */
+  transition: stroke-dashoffset 1s linear, stroke .2s ease;
+}
+.guard-seconds {
+  align-self: center;
+  font-size: 2.6rem;
+  font-weight: 700;
+  line-height: 1;
+}
+.guard-unit { align-self: center; margin-top: 1.1rem; font-size: 1rem; font-weight: 600; }
+
+.guard-title { font-size: 1rem; }
+.guard-countdown { color: var(--muted); font-size: .85rem; margin: 0; }
+
+.guard-actions {
+  display: flex;
+  gap: .6rem;
+  width: 100%;
+  margin-top: .9rem;
+}
+.guard-action { flex: 1; }
+
+.guard-keys {
+  margin: .6rem 0 0;
+  color: var(--muted);
+  font-size: .72rem;
+}
+
+/* Last seconds: the colour escalates, but the number and the draining ring
+   already carried the message — colour is never the only signal. */
+.guard.urgent .guard-card { border-color: var(--danger); }
+.guard.urgent .guard-clock { color: var(--danger); }
+.guard.urgent .guard-ring-bar { stroke: var(--danger); }
+.guard.urgent .guard-ring-track { stroke: color-mix(in srgb, var(--danger) 22%, transparent); }
 
 .toast {
   position: fixed;
   bottom: 4.5rem;
   left: 50%;
+  z-index: var(--z-toast);
   transform: translateX(-50%);
   padding: .55rem .9rem;
   border-radius: var(--radius);
@@ -359,12 +827,25 @@ button.danger { color: var(--danger); }
 }
 .toast.error { border-color: var(--danger); color: var(--danger); }
 
+/* Narrow: the toolbar keeps its icons, drops its words. The buttons keep
+   their accessible names and their full 2.25rem hit area. */
+@media (max-width: 34rem) {
+  .icon-button-label { display: none; }
+  .icon-button { padding: .3rem .55rem; }
+  .guard-actions { flex-direction: column; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     transition: none !important;
     animation: none !important;
   }
   .screen:hover { transform: none; }
+  /* The ring still empties — one visible step per second instead of a glide.
+     Removing the motion must not remove the information. The drawer still
+     needs its visibility switch, just without the delayed transition. */
+  .guard-ring-bar { transition: none; }
+  .drawer, .scrim { transition: none; }
 }
 
 /* Shown in place of the outputs when there are none to draw, so an empty

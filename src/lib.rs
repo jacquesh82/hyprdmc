@@ -17,6 +17,7 @@ pub mod daemon;
 pub mod emit;
 pub mod history;
 pub mod i18n;
+pub mod input;
 pub mod ipc;
 pub mod layout;
 pub mod monitor;

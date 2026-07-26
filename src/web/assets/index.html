@@ -40,19 +40,93 @@
     <h1>hyprdmc</h1>
     <span id="profile-badge" class="badge" hidden></span>
     <span class="spacer"></span>
+    <!--
+      History lives in a drawer, not in the main column: it is reference
+      material, consulted now and then, and it was costing the arrangement
+      canvas a third of its width permanently. `aria-expanded` + `aria-controls`
+      tie the button to the panel it opens.
+    -->
+    <button id="btn-history" class="icon-button" type="button"
+            data-i18n-attr="aria-label:web.history.title" aria-label="History"
+            aria-expanded="false" aria-controls="history-panel">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+        <path d="M3 3v5h5"/>
+        <path d="M12 7v5l4 2"/>
+      </svg>
+      <span class="icon-button-label" data-i18n="web.history.title">History</span>
+      <!-- A bare number appended to the button's accessible name would read as
+           "History 3" and mean nothing; the drawer states it in full words. -->
+      <span id="history-count" class="count" aria-hidden="true" hidden></span>
+    </button>
+    <!--
+      Export/import act on everything (profiles, keyboard, behaviour), not on
+      the active tab, so they live in the header rather than in either dock.
+      `aria-label` is set explicitly and permanently: the visible label
+      collapses on narrow screens, and a button whose only name is a hidden
+      span has no name at all.
+    -->
+    <button id="btn-export" class="icon-button" type="button"
+            data-i18n-attr="aria-label:web.action.export,title:web.action.export_title"
+            aria-label="Export the configuration">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <path d="M12 3v12"/>
+        <path d="m8 11 4 4 4-4"/>
+        <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+      </svg>
+      <span class="icon-button-label" data-i18n="web.action.export">Export</span>
+    </button>
+    <button id="btn-import" class="icon-button" type="button"
+            data-i18n-attr="aria-label:web.action.import,title:web.action.import_title"
+            aria-label="Import a configuration">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <path d="M12 15V3"/>
+        <path d="m8 7 4-4 4 4"/>
+        <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+      </svg>
+      <span class="icon-button-label" data-i18n="web.action.import">Import</span>
+    </button>
+    <!-- The file picker itself is never shown: the button above drives it, so
+         the control keeps the same look as its neighbours. -->
+    <input id="import-file" type="file" accept="application/json,.json" class="visually-hidden"
+           data-i18n-attr="aria-label:web.action.import" aria-label="Import a configuration">
     <button id="btn-theme" class="theme-toggle" type="button" aria-label="Theme: automatic">Auto</button>
     <span id="connection" class="dot" data-i18n-attr="title:web.connection" title="connection to the daemon"></span>
   </header>
 
-  <div id="guard" class="guard" hidden>
-    <span id="guard-text">Configuration applied.</span>
-    <button id="btn-confirm" class="primary" data-i18n="web.guard.keep">Keep</button>
-    <button id="btn-revert" data-i18n="web.guard.revert">Revert</button>
-  </div>
+  <!--
+    Two sections, not two pages: the keyboard has nothing to do with the
+    screens (a profile must never carry a keyboard layout), but both are
+    "how this machine is set up", and switching must not lose the draft
+    arrangement. Roving tabindex + arrow keys, per the ARIA tabs pattern.
+  -->
+  <nav class="tabs" role="tablist" data-i18n-attr="aria-label:web.tabs_label" aria-label="Sections">
+    <button id="tab-screens" class="tab" type="button" role="tab"
+            aria-selected="true" aria-controls="panel-screens" data-panel="panel-screens">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <rect x="2" y="4" width="20" height="13" rx="2"/>
+        <path d="M8 21h8M12 17v4"/>
+      </svg>
+      <span data-i18n="web.tab.screens">Displays</span>
+    </button>
+    <button id="tab-input" class="tab" type="button" role="tab"
+            aria-selected="false" tabindex="-1" aria-controls="panel-input" data-panel="panel-input">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <rect x="2" y="6" width="20" height="12" rx="2"/>
+        <path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/>
+      </svg>
+      <span data-i18n="web.tab.input">Keyboard &amp; pointer</span>
+    </button>
+  </nav>
 
   <div id="issues" class="issues" hidden></div>
 
-  <main>
+  <main id="panel-screens" role="tabpanel" aria-labelledby="tab-screens" tabindex="0">
     <section class="stage">
       <div id="canvas" class="canvas" tabindex="0" data-i18n-attr="aria-label:web.canvas_label" aria-label="Display arrangement"></div>
       <p class="hint" data-i18n="web.hint">
@@ -61,32 +135,186 @@
       </p>
     </section>
 
-    <div class="side">
-      <aside id="panel" class="panel">
-        <p class="empty" data-i18n="web.select_prompt">Select an output to configure it.</p>
-      </aside>
-
-      <aside id="history-panel" class="history">
-        <div class="history-head">
-          <h2 data-i18n="web.history.title">History</h2>
-          <span id="history-remembered" class="muted"></span>
-        </div>
-        <p id="history-empty" class="empty" data-i18n="web.history.empty">No layout applied yet.</p>
-        <ul id="history-list" class="history-list" hidden></ul>
-      </aside>
-    </div>
+    <aside id="panel" class="panel">
+      <p class="empty" data-i18n="web.select_prompt">Select an output to configure it.</p>
+    </aside>
   </main>
 
-  <footer>
-    <button id="btn-apply" class="primary" data-i18n="web.action.apply">Apply</button>
-    <button id="btn-reset" data-i18n="web.action.reset">Discard changes</button>
-    <button id="btn-auto" data-i18n="web.action.auto">Arrange automatically</button>
-    <span class="spacer"></span>
-    <button id="btn-save" data-i18n="web.action.save">Save as profile…</button>
-    <button id="btn-persist" data-i18n="web.action.persist">Make permanent</button>
-  </footer>
+  <main id="panel-input" class="input-page" role="tabpanel" aria-labelledby="tab-input" tabindex="0" hidden>
+    <section class="card">
+      <h2 data-i18n="web.input.keyboard">Keyboard</h2>
 
-  <div id="toast" class="toast" hidden></div>
+      <div class="field">
+        <label for="kb-layout" data-i18n="web.input.layout">Layout</label>
+        <select id="kb-layout"></select>
+      </div>
+
+      <div class="field">
+        <label for="kb-variant" data-i18n="web.input.variant">Variant</label>
+        <select id="kb-variant"></select>
+        <p class="helper" data-i18n="web.input.variant_help">Variants of the selected layout only.</p>
+      </div>
+
+      <div class="field">
+        <label for="kb-option-add" data-i18n="web.input.options">Options</label>
+        <!-- Options are a comma-separated list, so picking is "add to a set",
+             not "choose one": the select adds, the chips below remove. -->
+        <select id="kb-option-add"></select>
+        <ul id="kb-option-list" class="chips"></ul>
+        <p id="kb-options-empty" class="helper" data-i18n="web.input.options_none">No option set.</p>
+      </div>
+    </section>
+
+    <!--
+      Touchpad and mouse are two independent Hyprland settings, so they get two
+      independent controls, both on screen at once. Hiding one behind a device
+      selector meant you could never see what the other was set to — and
+      "natural on the touchpad, normal on the wheel" is the common pairing,
+      which is precisely the case that needs both values visible together.
+    -->
+    <section class="card">
+      <h2 data-i18n="web.input.pointer">Pointer</h2>
+
+      <fieldset class="group">
+        <!-- One setting, two devices: the legend names the setting so each row
+             only has to name its device. -->
+        <legend data-i18n="web.input.scroll">Scroll direction</legend>
+
+        <div class="field device">
+          <label id="scroll-touchpad-label" data-i18n="web.input.touchpad">Touchpad</label>
+          <div id="scroll-touchpad" class="segmented" role="group"
+               data-target="touchpad_natural_scroll" aria-labelledby="scroll-touchpad-label">
+            <button type="button" data-natural="false" aria-pressed="true" data-i18n="web.input.scroll_normal">Normal</button>
+            <button type="button" data-natural="true" aria-pressed="false" data-i18n="web.input.scroll_inverted">Inverted</button>
+          </div>
+        </div>
+
+        <div class="field device">
+          <label id="scroll-mouse-label" data-i18n="web.input.mouse">Mouse</label>
+          <div id="scroll-mouse" class="segmented" role="group"
+               data-target="natural_scroll" aria-labelledby="scroll-mouse-label">
+            <button type="button" data-natural="false" aria-pressed="true" data-i18n="web.input.scroll_normal">Normal</button>
+            <button type="button" data-natural="true" aria-pressed="false" data-i18n="web.input.scroll_inverted">Inverted</button>
+          </div>
+        </div>
+
+        <p class="helper" data-i18n="web.input.scroll_help">Inverted is “natural” scrolling: the content follows your fingers.</p>
+      </fieldset>
+    </section>
+
+    <p class="helper page-note" data-i18n="web.input.note">
+      Applied immediately. “Make permanent” writes input.lua so the settings survive a restart.
+    </p>
+  </main>
+
+  <!--
+    The action bar is docked at the bottom of the viewport: sticky, so it keeps
+    its place in the flow and a long page never hides its own controls.
+  -->
+  <!-- One dock, two sets of actions: the visible set follows the active tab,
+       because "Apply" means something different in each. -->
+  <div class="dock">
+    <footer id="actions-screens">
+      <div class="actions-primary">
+        <button id="btn-apply" class="primary cta" data-i18n="web.action.apply"
+                data-i18n-attr="title:web.action.apply_title">Apply</button>
+        <span id="pending" class="pending" hidden></span>
+        <button id="btn-reset" data-i18n="web.action.reset">Discard changes</button>
+        <button id="btn-auto" data-i18n="web.action.auto">Arrange automatically</button>
+        <!--
+          The daemon already reacts to hotplug on its own; this is the manual
+          way out when it did not — a compositor that swallowed the event, a
+          screen the driver reports late. It only re-reads, never re-applies:
+          detecting a screen must not move the ones already placed.
+        -->
+        <button id="btn-rescan" class="icon-button" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+            <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8"/>
+            <path d="M21 3v5h-5"/>
+            <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16"/>
+            <path d="M3 21v-5h5"/>
+          </svg>
+          <span data-i18n="web.action.rescan">Detect new displays</span>
+        </button>
+      </div>
+      <span class="spacer"></span>
+      <div class="actions-secondary">
+        <button id="btn-save" data-i18n="web.action.save">Save as profile…</button>
+        <button id="btn-persist" data-i18n="web.action.persist">Make permanent</button>
+      </div>
+    </footer>
+
+    <footer id="actions-input" hidden>
+      <div class="actions-primary">
+        <button id="btn-input-apply" class="primary cta" data-i18n="web.action.apply">Apply</button>
+        <button id="btn-input-reset" data-i18n="web.action.reset">Discard changes</button>
+      </div>
+      <span class="spacer"></span>
+      <div class="actions-secondary">
+        <button id="btn-input-persist" data-i18n="web.action.persist">Make permanent</button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Only drawn on narrow viewports, where the drawer overlays the content
+       instead of sitting beside it. Tapping it closes the drawer. -->
+  <div id="history-scrim" class="scrim"></div>
+
+  <aside id="history-panel" class="drawer" aria-labelledby="history-title" inert>
+    <div class="drawer-head">
+      <h2 id="history-title" data-i18n="web.history.title">History</h2>
+      <span id="history-remembered" class="muted"></span>
+      <button id="btn-history-close" class="icon-button icon-only" type="button"
+              data-i18n-attr="aria-label:web.history.close,title:web.history.close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M18 6 6 18M6 6l12 12"/>
+        </svg>
+      </button>
+    </div>
+    <div class="drawer-body">
+      <p id="history-empty" class="empty" data-i18n="web.history.empty">No layout applied yet.</p>
+      <ul id="history-list" class="history-list" hidden></ul>
+    </div>
+  </aside>
+
+  <!--
+    The revert guard is a modal dialog, centred: it is the one moment where the
+    user may be looking at a screen they cannot read, so it takes over the
+    viewport rather than competing with the rest of the page for attention.
+    `<dialog>` (opened with showModal) gives the focus trap, the inert
+    background and the top layer for free; `role="alertdialog"` makes assistive
+    tech announce it in full on open. Focus moves to "Keep" (see app.js), so
+    Enter keeps and Escape reverts without touching the mouse.
+  -->
+  <dialog id="guard" class="guard" role="alertdialog"
+          aria-labelledby="guard-title" aria-describedby="guard-countdown">
+    <div class="guard-card">
+      <!-- Ring + digits say the same thing two ways: a bar alone is not
+           readable, a number alone is not noticeable. -->
+      <div class="guard-clock" aria-hidden="true">
+        <svg class="guard-ring" viewBox="0 0 80 80" aria-hidden="true" focusable="false">
+          <circle class="guard-ring-track" cx="40" cy="40" r="34"/>
+          <circle id="guard-ring-bar" class="guard-ring-bar" cx="40" cy="40" r="34"/>
+        </svg>
+        <span id="guard-seconds" class="guard-seconds">10</span>
+        <span class="guard-unit">s</span>
+      </div>
+      <strong id="guard-title" class="guard-title" data-i18n="web.guard.applied">Configuration applied — keep it?</strong>
+      <p id="guard-countdown" class="guard-countdown">Reverting automatically in 10 s.</p>
+      <div class="guard-actions">
+        <button id="btn-confirm" class="primary cta guard-action" data-i18n="web.guard.keep">Keep</button>
+        <button id="btn-revert" class="danger cta guard-action" data-i18n="web.guard.revert">Revert now</button>
+      </div>
+      <p class="guard-keys" data-i18n="web.guard.keys">Enter to keep · Esc to revert</p>
+    </div>
+    <!-- Announced only at the thresholds that matter (see app.js): a live
+         region firing every second would talk over the buttons it describes. -->
+    <p id="guard-announce" class="visually-hidden" role="status" aria-live="assertive"></p>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
   <script src="/app.js"></script>
 </body>

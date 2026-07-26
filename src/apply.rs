@@ -292,7 +292,7 @@ pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<
     }
 
     let previous = snapshot(backend)?;
-    let specs = layout.to_specs();
+    let specs = layout.to_lua_calls();
 
     let mut report = ApplyReport {
         specs: specs.clone(),
@@ -320,7 +320,7 @@ pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<
 /// Reapplies a known layout, without validation or verification: we're going
 /// back to a state that worked, and this must not fail.
 pub fn restore(backend: &dyn HyprBackend, layout: &Layout) -> Result<()> {
-    backend.set_monitors(&layout.to_specs())
+    backend.set_monitors(&layout.to_lua_calls())
 }
 
 /// Asks the user for confirmation and restores the previous state if there
@@ -506,8 +506,17 @@ mod tests {
         assert!(drifts[0].message.contains("disabled"));
     }
 
+    /// The `eval` requests sent to the compositor, in order.
+    fn evals(backend: &FakeBackend) -> Vec<String> {
+        backend
+            .sent_commands()
+            .into_iter()
+            .filter(|c| c.starts_with("/eval "))
+            .collect()
+    }
+
     #[test]
-    fn apply_sends_a_single_batch_and_reports_success() {
+    fn apply_sends_a_single_eval_and_reports_success() {
         let json = monitors_json(&[
             ("eDP-1", 1920, 1080, 0, 0, 1.0, 0, false),
             ("DP-1", 1920, 1080, 1920, 0, 1.0, 0, false),
@@ -522,14 +531,14 @@ mod tests {
         assert!(report.succeeded());
         assert!(!report.rolled_back);
 
-        let batches: Vec<String> = backend
-            .sent_commands()
-            .into_iter()
-            .filter(|c| c.starts_with("[[BATCH]]"))
-            .collect();
-        assert_eq!(batches.len(), 1, "expected a single round trip");
-        assert!(batches[0].contains("keyword monitor eDP-1,1920x1080@60.00,0x0,1"));
-        assert!(batches[0].contains("keyword monitor DP-1,1920x1080@60.00,1920x0,1"));
+        let sent = evals(&backend);
+        assert_eq!(sent.len(), 1, "expected a single round trip");
+        assert!(
+            sent[0].contains(r#"output = "eDP-1", mode = "1920x1080@60.00", position = "0x0""#)
+        );
+        assert!(
+            sent[0].contains(r#"output = "DP-1", mode = "1920x1080@60.00", position = "1920x0""#)
+        );
     }
 
     #[test]
@@ -547,7 +556,7 @@ mod tests {
             !backend
                 .sent_commands()
                 .iter()
-                .any(|c| c.contains("keyword monitor")),
+                .any(|c| c.contains("hl.monitor(")),
             "no command should be sent"
         );
     }
@@ -564,16 +573,12 @@ mod tests {
         assert!(report.rolled_back);
         assert!(!report.succeeded());
 
-        let batches: Vec<String> = backend
-            .sent_commands()
-            .into_iter()
-            .filter(|c| c.starts_with("[[BATCH]]"))
-            .collect();
-        assert_eq!(batches.len(), 2, "apply then restore");
+        let sent = evals(&backend);
+        assert_eq!(sent.len(), 2, "apply then restore");
         assert!(
-            batches[1].contains("DP-1,1920x1080@60.00,0x0,1"),
+            sent[1].contains(r#"position = "0x0""#),
             "restore must rewrite the original state: {}",
-            batches[1]
+            sent[1]
         );
     }
 

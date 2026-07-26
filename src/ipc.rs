@@ -27,6 +27,10 @@ pub trait HyprBackend: Send + Sync {
     fn query(&self, cmd: &str) -> Result<String>;
 
     /// Applies several commands in a single Hyprland transaction.
+    ///
+    /// Beware: Hyprland splits a batch on `;`, so this is only usable for
+    /// commands that cannot contain one — Lua code notably cannot go
+    /// through here.
     fn batch(&self, cmds: &[String]) -> Result<String> {
         if cmds.is_empty() {
             return Ok(String::new());
@@ -41,15 +45,30 @@ pub trait HyprBackend: Send + Sync {
             .with_context(|| t!("ipc.unexpected_response", body = truncate(&raw)).to_string())
     }
 
-    /// Applies a series of `monitor = …` directives and checks that none of
+    /// Applies a series of `hl.monitor{…}` calls and checks that none of
     /// them were rejected.
-    fn set_monitors(&self, specs: &[String]) -> Result<()> {
-        let cmds: Vec<String> = specs
-            .iter()
-            .map(|s| format!("keyword monitor {s}"))
-            .collect();
-        let reply = self.batch(&cmds)?;
-        check_ok(&reply, &cmds)
+    ///
+    /// Since Hyprland 0.55 the configuration is Lua and `keyword` is
+    /// refused outright ("keyword can't work with non-legacy parsers"), so
+    /// everything goes through `eval`. All the calls travel in a *single*
+    /// request: `[[BATCH]]` would cut the Lua in half at the first `;`, and
+    /// one request also means the compositor reconfigures the outputs once
+    /// rather than once per screen.
+    fn set_monitors(&self, calls: &[String]) -> Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let reply = self.query(&format!("/eval {}", calls.join(" ")))?;
+        check_ok(&reply, calls)
+    }
+
+    /// Runs one Lua statement and fails if the compositor rejected it.
+    ///
+    /// Same road as [`Self::set_monitors`], for the settings that are not
+    /// monitors — keyboard and pointer (see [`crate::input`]).
+    fn eval(&self, lua: &str) -> Result<()> {
+        let reply = self.query(&format!("/eval {lua}"))?;
+        check_ok(&reply, &[lua.to_string()])
     }
 }
 
@@ -57,12 +76,7 @@ pub trait HyprBackend: Send + Sync {
 /// error message that must be surfaced to the user as-is.
 fn check_ok(reply: &str, cmds: &[String]) -> Result<()> {
     let trimmed = reply.trim();
-    if trimmed.is_empty() || trimmed.chars().all(|c| c.is_whitespace()) {
-        return Ok(());
-    }
-    // A batch's response is the concatenation of "ok"s.
-    let leftovers = trimmed.replace("ok", "");
-    if leftovers.trim().is_empty() {
+    if trimmed.lines().all(|l| matches!(l.trim(), "" | "ok")) {
         return Ok(());
     }
     bail!(
@@ -273,12 +287,27 @@ pub mod fake {
         /// takes a few reads to converge. The last one keeps being served
         /// afterwards.
         pending_states: Mutex<Vec<String>>,
+        /// Canned `j/getoption` replies, keyed by option name.
+        options: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeBackend {
         pub fn with_monitors(json: &str) -> Self {
             Self {
                 monitors_json: Mutex::new(json.to_string()),
+                ..Default::default()
+            }
+        }
+
+        /// Backend that answers `j/getoption` from a fixed table.
+        pub fn with_options(options: &[(&str, &str)]) -> Self {
+            Self {
+                options: Mutex::new(
+                    options
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect(),
+                ),
                 ..Default::default()
             }
         }
@@ -320,6 +349,21 @@ pub mod fake {
                     return Ok(stale);
                 }
                 return Ok(self.monitors_json.lock().unwrap().clone());
+            }
+            if let Some(option) = cmd.strip_prefix("j/getoption ") {
+                let options = self.options.lock().unwrap();
+                let found = options.iter().find(|(name, _)| name == option.trim());
+                // An option nobody stubbed answers like Hyprland does for one
+                // that was never set, rather than blowing up the test.
+                return Ok(found.map_or_else(
+                    || {
+                        format!(
+                            r#"{{"option":"{}","str":"[[EMPTY]]","set":false}}"#,
+                            option.trim()
+                        )
+                    },
+                    |(_, reply)| reply.clone(),
+                ));
             }
             Ok("ok".to_string())
         }
@@ -377,12 +421,9 @@ mod tests {
     #[test]
     fn batch_joins_commands() {
         let fake = fake::FakeBackend::default();
-        fake.batch(&["keyword monitor A".into(), "keyword monitor B".into()])
+        fake.batch(&["dispatch A".into(), "dispatch B".into()])
             .unwrap();
-        assert_eq!(
-            fake.sent_commands(),
-            vec!["[[BATCH]]keyword monitor A;keyword monitor B"]
-        );
+        assert_eq!(fake.sent_commands(), vec!["[[BATCH]]dispatch A;dispatch B"]);
     }
 
     #[test]
@@ -393,10 +434,33 @@ mod tests {
     }
 
     #[test]
+    fn monitors_are_applied_through_a_single_eval() {
+        // A batch would split the Lua on its first `;`.
+        let fake = fake::FakeBackend::default();
+        fake.set_monitors(&[
+            "hl.monitor({ output = \"A\" })".into(),
+            "hl.monitor({ output = \"B\" })".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            fake.sent_commands(),
+            vec!["/eval hl.monitor({ output = \"A\" }) hl.monitor({ output = \"B\" })"]
+        );
+    }
+
+    #[test]
+    fn applying_nothing_touches_no_socket() {
+        let fake = fake::FakeBackend::default();
+        fake.set_monitors(&[]).unwrap();
+        assert!(fake.sent_commands().is_empty());
+    }
+
+    #[test]
     fn rejected_configuration_surfaces_hyprland_message() {
-        let cmds = vec!["keyword monitor DP-1,bogus".to_string()];
-        let err = check_ok("Invalid mode for monitor", &cmds).unwrap_err();
-        assert!(err.to_string().contains("Invalid mode"));
-        assert!(check_ok("okok", &cmds).is_ok());
+        let cmds = vec!["hl.monitor({ output = \"DP-1\", mode = \"bogus\" })".to_string()];
+        let err = check_ok("error: hl.monitor: error applying field 'mode'", &cmds).unwrap_err();
+        assert!(err.to_string().contains("error applying field"));
+        assert!(check_ok("ok", &cmds).is_ok());
+        assert!(check_ok("ok\n\n\nok", &cmds).is_ok());
     }
 }
