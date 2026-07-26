@@ -23,6 +23,7 @@ the right profile on its own** whenever the hardware changes.
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Web UI](#web-ui)
+- [Keyboard and Pointer](#keyboard-and-pointer)
 - [Command Line](#command-line)
 - [Profiles](#profiles)
 - [History and Recall](#history-and-recall)
@@ -33,6 +34,7 @@ the right profile on its own** whenever the hardware changes.
 - [Safety Net](#safety-net)
 - [HTTP API](#http-api)
 - [Configuration](#configuration)
+- [Import and Export](#import-and-export)
 - [Language](#language)
 - [Development](#development)
 - [Under the Hood](#under-the-hood)
@@ -45,7 +47,8 @@ the right profile on its own** whenever the hardware changes.
 - **Positioning** — pixel-precise, relative (`right-of`, `below`, …), or automatic arrangement.
 - **Rotation and flipping** — 0/90/180/270°, with or without a mirror effect.
 - **Mirroring** — one output can duplicate another's image.
-- **Web UI** — a drag-and-drop canvas with snapping, right in the browser.
+- **Web UI** — a drag-and-drop canvas with snapping, right in the browser, plus a tab for
+  the keyboard and pointer.
 - **Profiles** — one layout per situation, identified by the monitors plugged in.
 - **Hotplugging** — a daemon watches Hyprland and applies the right profile automatically.
 - **Recall** — arrange your screens once; the same set of screens gets that layout back on
@@ -93,7 +96,7 @@ hyprdmc arrange DP-1 right-of eDP-1
 # 3. Save the current layout under a name
 hyprdmc profile save desk
 
-# 4. Wire monitors.lua into hyprland.lua (backs it up automatically)
+# 4. Wire monitors.lua and input.lua into hyprland.lua (backs it up automatically)
 hyprdmc init
 
 # 5. Start the daemon: hotplug watcher + web UI on http://127.0.0.1:8787
@@ -109,14 +112,28 @@ hyprdmc daemon         # UI + hotplug watcher
 
 Then open <http://127.0.0.1:8787>.
 
+Two tabs: **Displays** and **Keyboard & pointer**. Switching between them keeps an
+unapplied arrangement intact.
+
 - Drag monitors on the canvas: they **snap** to neighboring edges.
 - Arrow keys for fine adjustment (`Shift` for 100 px steps).
 - Side panel: mode, scale, rotation, flip, mirroring, VRR, enable/disable.
-- Overlaps are flagged in red and block the **Apply** button.
-- After applying, a banner lets you **keep** the change or **revert** it; if you don't
-  answer, the previous configuration is restored automatically.
-- A history panel lists the last few layouts, one click away from being restored.
+- Overlaps are flagged in red and block the **Apply** button, which carries a count of the
+  outputs the pending change would touch.
+- After applying, a **centred dialog** counts down: keep the change or revert it, `Enter`
+  and `Escape` respectively. If you don't answer, the previous configuration comes back on
+  its own. `Ctrl+Enter` applies from anywhere in the page.
+- **Detect new displays** re-reads the outputs on demand, for the rare case where the
+  compositor swallowed the hotplug event. It only reads — detecting a screen never moves
+  the ones already placed, and a screen that appears while you have unapplied changes
+  joins your work instead of erasing it.
+- The **history** lives in a drawer opened from the header, listing the last layouts one
+  click away from being restored. It is remembered open or closed between visits.
+- **Export** / **Import** in the header: the whole configuration as a JSON file.
 - State updates live (SSE) whenever a monitor is plugged in or unplugged.
+
+The interface follows the system's light or dark theme, or an explicit choice made with the
+toggle in the header.
 
 `hyprdmc web` opens the page in your default browser once the port is actually listening.
 `hyprdmc daemon` does not: a background service that pops a window open on every session
@@ -128,6 +145,33 @@ knowingly, since the API has **no authentication whatsoever**:
 
 ```sh
 hyprdmc web --bind 0.0.0.0 --port 8787
+```
+
+## Keyboard and Pointer
+
+The second tab of the web UI sets what you type with and how you scroll:
+
+- **Keyboard** — xkb layout, variant, and options (compose key, `ctrl:nocaps`, …). The
+  catalogue comes from `/usr/share/X11/xkb/rules/base.lst`, so the list is the same one
+  `setxkbmap` uses; variants are filtered down to the selected layout.
+- **Pointer** — scroll direction for the touchpad and for the mouse, side by side. These
+  are two independent Hyprland settings, and "natural on the touchpad, normal on the wheel"
+  is a common pairing — so both are set separately and both stay visible.
+
+**This is deliberately not part of a screen profile.** Docking a laptop must not change the
+keyboard layout. The settings live in their own `[input]` section of `config.toml` and their
+own generated file, `input.lua`, which `hyprdmc init` wires into `hyprland.lua` next to
+`monitors.lua`.
+
+Changes apply immediately, with no revert countdown: a layout you cannot type in is
+annoying, not a lock-out — the mouse still works and the page is still readable. The
+countdown is reserved for changes that can leave you staring at a black screen. Press
+**Make permanent** to write `input.lua` so the settings survive a compositor restart.
+
+```lua
+-- Generated by hyprdmc — DO NOT EDIT BY HAND.
+-- Keyboard and pointer only: the screens live in monitors.lua.
+hl.config({ input = { kb_layout = "fr", kb_variant = "oss", kb_options = "compose:ralt", natural_scroll = false, touchpad = { natural_scroll = true } } })
 ```
 
 ## Command Line
@@ -250,6 +294,11 @@ hyprdmc history clear            # forget everything, recall included
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
+Everything that gets applied is filed, whichever way it was applied: the CLI, a hotplug
+reconcile, or the web UI. A layout applied with the safety net armed is filed **when you
+confirm it**, not when it is applied — an arrangement you rejected, or let revert on its
+own, has no business in an undo list. A layout Hyprland rolled back is never filed either.
+
 Identical consecutive layouts are collapsed: every hotplug event triggers a reconcile, and
 without that the list would fill up with five copies of the same thing and push the entry
 you actually want out of reach. Restoring goes through the same safety net as any other
@@ -315,8 +364,9 @@ systemctl --user enable --now hyprdmc.service
 
 ## Persistence
 
-`hyprdmc` never rewrites the rest of your `hyprland.lua`. It manages its own file,
-`~/.config/hypr/monitors.lua`, and wires it in only once:
+`hyprdmc` never rewrites the rest of your `hyprland.lua`. It manages its own files —
+`~/.config/hypr/monitors.lua` for the screens and `~/.config/hypr/input.lua` for the
+keyboard and pointer — and wires them in only once, in a single pass:
 
 ```sh
 hyprdmc init --dry-run     # show what would be done
@@ -467,6 +517,33 @@ Fields of a rule: `match` (required), `enabled`, `mode`, `position`, `scale`, `r
 `flipped`, `mirror_of`, `vrr`. `mode` and `position` accept `"auto"` to let `hyprdmc` decide.
 
 Logging: `HYPRDMC_LOG=hyprdmc=debug hyprdmc daemon`.
+
+## Import and Export
+
+The **Export** button in the web UI downloads everything — settings, profiles, keyboard and
+pointer — as a single JSON file, indented so it can be read, diffed and edited by hand:
+
+```json
+{
+  "kind": "hyprdmc-config",
+  "version": 1,
+  "config": {
+    "settings": { "auto_apply": true, "confirm_timeout_secs": 10, ... },
+    "input": { "kb_layout": "fr", "touchpad_natural_scroll": true, ... },
+    "profile": [ { "name": "desk", "output": [ ... ] } ]
+  }
+}
+```
+
+**Import** replaces the configuration with such a file, after confirming. The `kind` and
+`version` markers mean a file that is not a hyprdmc export is refused with a sentence
+rather than a parse error.
+
+Four fields are deliberately **not** imported: `web_port`, `bind`, `monitors_lua` and
+`input_lua`. A configuration exported on another machine carries that machine's home
+directory, and silently writing `monitors.lua` into a path that does not exist here would
+look like hyprdmc breaking. Everything you actually meant to move — profiles, keyboard and
+pointer, behaviour — comes across.
 
 ## Language
 
