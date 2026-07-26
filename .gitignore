@@ -1,0 +1,7 @@
+/target
+
+# Outillage local, hors périmètre du projet
+/.claude/
+/.dual-graph/
+/CLAUDE.md
+/CONTEXT.md

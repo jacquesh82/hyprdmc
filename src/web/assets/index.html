@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hyprmc — écrans</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>hyprmc</h1>
+    <span id="profile-badge" class="badge" hidden></span>
+    <span class="spacer"></span>
+    <span id="connection" class="dot" title="connexion au démon"></span>
+  </header>
+
+  <div id="guard" class="guard" hidden>
+    <span id="guard-text">Configuration appliquée.</span>
+    <button id="btn-confirm" class="primary">Conserver</button>
+    <button id="btn-revert">Revenir en arrière</button>
+  </div>
+
+  <div id="issues" class="issues" hidden></div>
+
+  <main>
+    <section class="stage">
+      <div id="canvas" class="canvas" tabindex="0" aria-label="Disposition des écrans"></div>
+      <p class="hint">
+        Glissez un écran pour le déplacer — il s'aimante aux bords voisins.
+        Flèches du clavier pour un réglage fin.
+      </p>
+    </section>
+
+    <aside id="panel" class="panel">
+      <p class="empty">Sélectionnez un écran pour le configurer.</p>
+    </aside>
+  </main>
+
+  <footer>
+    <button id="btn-apply" class="primary">Appliquer</button>
+    <button id="btn-reset">Annuler les modifications</button>
+    <button id="btn-auto">Ranger automatiquement</button>
+    <span class="spacer"></span>
+    <button id="btn-save">Enregistrer comme profil…</button>
+    <button id="btn-persist">Rendre permanent</button>
+  </footer>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
