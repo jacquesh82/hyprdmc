@@ -2,6 +2,22 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!--
+    Applies any explicitly-chosen theme before first paint, so there is no
+    flash of the wrong theme while app.js is still loading. "auto" (the
+    default) leaves no attribute, so `prefers-color-scheme` decides — see
+    style.css. Kept in sync with the theme-cycling logic in app.js.
+  -->
+  <script>
+    (function () {
+      try {
+        var stored = localStorage.getItem('hyprdmc.theme');
+        if (stored === 'light' || stored === 'dark') {
+          document.documentElement.setAttribute('data-theme', stored);
+        }
+      } catch (err) { /* localStorage unavailable (e.g. private mode): fall back to auto */ }
+    })();
+  </script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!--
     Localization convention (see app.js for the implementation):
@@ -15,13 +31,16 @@
     reached, so the page never renders blank.
   -->
   <title data-i18n="web.title">hyprdmc — displays</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header>
+    <img src="/icon.svg" alt="" class="app-icon" width="24" height="24">
     <h1>hyprdmc</h1>
     <span id="profile-badge" class="badge" hidden></span>
     <span class="spacer"></span>
+    <button id="btn-theme" class="theme-toggle" type="button" aria-label="Theme: automatic">Auto</button>
     <span id="connection" class="dot" data-i18n-attr="title:web.connection" title="connection to the daemon"></span>
   </header>
 
@@ -42,9 +61,20 @@
       </p>
     </section>
 
-    <aside id="panel" class="panel">
-      <p class="empty" data-i18n="web.select_prompt">Select an output to configure it.</p>
-    </aside>
+    <div class="side">
+      <aside id="panel" class="panel">
+        <p class="empty" data-i18n="web.select_prompt">Select an output to configure it.</p>
+      </aside>
+
+      <aside id="history-panel" class="history">
+        <div class="history-head">
+          <h2 data-i18n="web.history.title">History</h2>
+          <span id="history-remembered" class="muted"></span>
+        </div>
+        <p id="history-empty" class="empty" data-i18n="web.history.empty">No layout applied yet.</p>
+        <ul id="history-list" class="history-list" hidden></ul>
+      </aside>
+    </div>
   </main>
 
   <footer>

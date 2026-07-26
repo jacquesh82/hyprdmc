@@ -25,6 +25,8 @@ the right profile on its own** whenever the hardware changes.
 - [Web UI](#web-ui)
 - [Command Line](#command-line)
 - [Profiles](#profiles)
+- [History and Recall](#history-and-recall)
+- [Notifications](#notifications)
 - [Daemon and Hotplugging](#daemon-and-hotplugging)
 - [Persistence](#persistence)
 - [Rotation and Flipping](#rotation-and-flipping)
@@ -46,6 +48,10 @@ the right profile on its own** whenever the hardware changes.
 - **Web UI** — a drag-and-drop canvas with snapping, right in the browser.
 - **Profiles** — one layout per situation, identified by the monitors plugged in.
 - **Hotplugging** — a daemon watches Hyprland and applies the right profile automatically.
+- **Recall** — arrange your screens once; the same set of screens gets that layout back on
+  its own, with no profile to name and nothing to configure.
+- **History** — the last five layouts applied, restorable one command away.
+- **Notifications** — the daemon says on your desktop what it detected and what it applied.
 - **Safety net** — any change is rolled back automatically if you don't confirm it.
 - **Persistence** — writes `monitors.conf` without ever touching your `hyprland.conf`.
 - **No dependencies** — talks directly to Hyprland's sockets, `hyprctl` isn't required.
@@ -104,7 +110,13 @@ Then open <http://127.0.0.1:8787>.
 - Overlaps are flagged in red and block the **Apply** button.
 - After applying, a banner lets you **keep** the change or **revert** it; if you don't
   answer, the previous configuration is restored automatically.
+- A history panel lists the last few layouts, one click away from being restored.
 - State updates live (SSE) whenever a monitor is plugged in or unplugged.
+
+`hyprdmc web` opens the page in your default browser once the port is actually listening.
+`hyprdmc daemon` does not: a background service that pops a window open on every session
+start would be intrusive. `--open` and `--no-open` override either default, and a missing
+browser only prints the URL instead of failing the command.
 
 Listening is restricted to `127.0.0.1` by default. To open it up to your local network —
 knowingly, since the API has **no authentication whatsoever**:
@@ -156,6 +168,9 @@ Relations: `left-of`, `right-of`, `above`, `below`, `same-as`
 | `--no-confirm` | skip the confirmation prompt and automatic rollback |
 | `-v`, `--verbose` | verbose logging |
 
+`--no-confirm` means "don't ask", not "don't record": a layout applied that way still lands
+in the history.
+
 ## Profiles
 
 A profile describes a layout and how to recognize the monitors it applies to.
@@ -193,6 +208,60 @@ A connected monitor the profile doesn't mention isn't ignored: it's enabled at i
 mode and placed to the right of the layout.
 
 If no profile matches, monitors are simply arranged left to right.
+
+## History and Recall
+
+`hyprdmc` remembers two things, in `$XDG_STATE_HOME/hyprdmc/state.json`. This is derived
+data you never edit — it lives apart from your configuration on purpose.
+
+### Recall — the part you never have to set up
+
+Every layout that gets applied is filed under the set of screens it was applied to,
+identified by their fingerprints rather than their connectors. Plug the same screens back
+in and that layout comes back on its own, whatever port they land on.
+
+This is what makes the tool useful before you have configured anything: arrange your
+screens once, and redocking just works. When a named profile also matches, the profile
+wins — an explicit choice outranks an implicit one. Set `remember = false` to switch the
+behaviour off.
+
+### History — five steps of undo
+
+The last five layouts applied are kept, newest first, and can be restored at any time —
+including long after the confirmation window has closed.
+
+```sh
+hyprdmc history                  # list them
+hyprdmc history restore 1        # go back one step
+hyprdmc history clear            # forget everything, recall included
+```
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│ #   When       Origin   Layout                                            │
+╞═══════════════════════════════════════════════════════════════════════════╡
+│ 0   just now   manual   eDP-1 1920x1080@0x0, DP-1 540x960@1920x0 90°      │
+│ 1   4 min ago  desk     eDP-1 1920x1080@0x0, DP-1 1920x1080@1920x0        │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+Identical consecutive layouts are collapsed: every hotplug event triggers a reconcile, and
+without that the list would fill up with five copies of the same thing and push the entry
+you actually want out of reach. Restoring goes through the same safety net as any other
+change, so an unwanted restore reverts on its own.
+
+## Notifications
+
+The daemon acts while you are looking elsewhere, so it says what it did. Each notification
+names what changed and which layout was chosen:
+
+- `connected: DP-1` — *Profile "desk" applied*
+- `disconnected: DP-1` — *Restored the layout you last used with these displays*
+- `connected: DP-1` — *No known layout: displays arranged left to right*
+
+They replace one another rather than stacking, since docking a laptop fires several events
+in a row. Notifications need `notify-send` (libnotify) and a running notification daemon;
+without either, they are silently skipped. Set `notifications = false` to turn them off.
 
 ## Daemon and Hotplugging
 
@@ -320,6 +389,9 @@ bypasses it for a single command.
 | `PUT` | `/api/profiles/{name}` | save a profile |
 | `DELETE` | `/api/profiles/{name}` | delete a profile |
 | `POST` | `/api/profiles/{name}/apply` | apply a profile |
+| `GET` | `/api/history` | the last few applied layouts |
+| `POST` | `/api/history/{index}/restore` | reapply a recorded layout |
+| `GET` | `/api/i18n` | UI strings for the active language |
 | `GET` | `/api/events` | SSE stream pushing state on every change |
 
 ```sh
@@ -338,6 +410,9 @@ bind = "127.0.0.1"
 auto_apply = true               # the daemon applies the matching profile on hotplug
 confirm_timeout_secs = 10       # 0 = no automatic rollback
 monitors_conf = "/home/you/.config/hypr/monitors.conf"
+notifications = true            # announce changes on the desktop
+remember = true                 # recall the layout last used with these screens
+language = "en"                 # omit to follow the system locale
 
 [[profile]]
 name = "desk"

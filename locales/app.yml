@@ -344,6 +344,82 @@ cli.init.current_persisted:
   en: "Current layout written to %{path}."
   fr: "Agencement courant écrit dans %{path}."
 
+# --------------------------------------------------- origin & notifications --
+origin.profile:
+  en: "Profile “%{name}” applied"
+  fr: "Profil « %{name} » appliqué"
+origin.recalled:
+  en: "Restored the layout you last used with these displays"
+  fr: "Agencement déjà utilisé avec ces écrans restauré"
+origin.arranged:
+  en: "No known layout: displays arranged left to right"
+  fr: "Aucun agencement connu : écrans rangés de gauche à droite"
+origin.unchanged:
+  en: "Current layout is usable, left unchanged"
+  fr: "Agencement actuel utilisable, laissé tel quel"
+notify.startup:
+  en: "hyprdmc started"
+  fr: "hyprdmc démarré"
+notify.connected:
+  en: "connected: %{outputs}"
+  fr: "branché : %{outputs}"
+notify.disconnected:
+  en: "disconnected: %{outputs}"
+  fr: "débranché : %{outputs}"
+notify.changed:
+  en: "Displays changed"
+  fr: "Changement d'écrans"
+notify.failed:
+  en: "Could not apply a layout — see the logs"
+  fr: "Application impossible — consultez le journal"
+notify.manual:
+  en: "Automatic apply is off, nothing was changed"
+  fr: "Application automatique désactivée, rien n'a été changé"
+
+# -------------------------------------------------------------- history -----
+history.empty:
+  en: "No configuration recorded yet."
+  fr: "Aucune configuration enregistrée pour l'instant."
+history.table.position:
+  en: "#"
+  fr: "#"
+history.table.when:
+  en: "When"
+  fr: "Quand"
+history.table.origin:
+  en: "Origin"
+  fr: "Origine"
+history.table.layout:
+  en: "Layout"
+  fr: "Agencement"
+history.origin.manual:
+  en: "manual"
+  fr: "manuel"
+history.restored:
+  en: "Configuration #%{index} restored (%{when})."
+  fr: "Configuration n°%{index} restaurée (%{when})."
+history.unknown_entry:
+  en: "no history entry at position %{index}"
+  fr: "aucune entrée d'historique à la position %{index}"
+history.cleared:
+  en: "History and remembered layouts cleared."
+  fr: "Historique et agencements mémorisés effacés."
+history.recall_known:
+  en: "%{count} display set(s) remembered."
+  fr: "%{count} configuration(s) d'écrans mémorisée(s)."
+time.just_now:
+  en: "just now"
+  fr: "à l'instant"
+time.minutes_ago:
+  en: "%{count} min ago"
+  fr: "il y a %{count} min"
+time.hours_ago:
+  en: "%{count} h ago"
+  fr: "il y a %{count} h"
+time.days_ago:
+  en: "%{count} d ago"
+  fr: "il y a %{count} j"
+
 # -------------------------------------------------------------------- web ---
 web.title:
   en: "hyprdmc — displays"
@@ -450,3 +526,36 @@ web.issue.mirror_unavailable:
 web.not_found:
   en: "not found"
   fr: "introuvable"
+web.theme.toggle_label:
+  en: "Theme: %{mode}"
+  fr: "Thème : %{mode}"
+web.theme.auto:
+  en: "Auto"
+  fr: "Auto"
+web.theme.light:
+  en: "Light"
+  fr: "Clair"
+web.theme.dark:
+  en: "Dark"
+  fr: "Sombre"
+web.history.title:
+  en: "History"
+  fr: "Historique"
+web.history.empty:
+  en: "No layout applied yet."
+  fr: "Aucun agencement appliqué pour l'instant."
+web.history.remembered:
+  en: "%{count} layout(s) remembered"
+  fr: "%{count} agencement(s) mémorisé(s)"
+web.history.origin_manual:
+  en: "manual"
+  fr: "manuel"
+web.history.restore:
+  en: "Restore"
+  fr: "Restaurer"
+web.history.restore_aria:
+  en: "Restore the configuration from %{when}"
+  fr: "Restaurer la configuration datant de %{when}"
+web.history.restored:
+  en: "Configuration #%{index} restored (%{when})."
+  fr: "Configuration n°%{index} restaurée (%{when})."

@@ -73,6 +73,12 @@ pub enum Command {
     /// Writes the current layout to `monitors.conf`.
     Persist,
 
+    /// The last few layouts that were applied, and how to get back to them.
+    History {
+        #[command(subcommand)]
+        action: Option<HistoryAction>,
+    },
+
     /// Wires `monitors.conf` into `hyprland.conf`.
     Init {
         /// Shows what would be done without changing anything.
@@ -238,4 +244,21 @@ pub enum ProfileAction {
 
     /// Renames a profile.
     Rename { from: String, to: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HistoryAction {
+    /// List the recorded layouts (the default).
+    List,
+
+    /// Reapply a recorded layout. `0` is the most recent.
+    Restore {
+        index: usize,
+
+        #[command(flatten)]
+        safety: SafetyArgs,
+    },
+
+    /// Forget the history and every remembered display set.
+    Clear,
 }

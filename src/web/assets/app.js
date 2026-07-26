@@ -58,6 +58,21 @@ const I18N_DEFAULTS = {
   'web.issue.all_disabled': 'every output would be disabled',
   'web.issue.mirror_unavailable': '"%{name}" mirrors an unavailable output',
   'web.not_found': 'not found',
+  // Theme toggle. Not yet in locales/app.yml nor in the WEB_KEYS whitelist
+  // served by /api/i18n (see src/web/mod.rs) — until that lands, these
+  // English defaults are what every locale sees.
+  'web.theme.toggle_label': 'Theme: %{mode}',
+  'web.theme.auto': 'Auto',
+  'web.theme.light': 'Light',
+  'web.theme.dark': 'Dark',
+  // History panel. Same caveat: proposed keys, not wired server-side yet.
+  'web.history.title': 'History',
+  'web.history.empty': 'No layout applied yet.',
+  'web.history.remembered': '%{count} layout(s) remembered',
+  'web.history.origin_manual': 'manual',
+  'web.history.restore': 'Restore',
+  'web.history.restore_aria': 'Restore the configuration from %{when}',
+  'web.history.restored': 'Configuration #%{index} restored (%{when}).',
 };
 
 let i18nStrings = {};
@@ -105,6 +120,55 @@ function applyStaticI18n() {
     }
   }
 }
+
+// ------------------------------------------------------------------ theme --
+
+const THEME_KEY = 'hyprdmc.theme';
+const THEME_ORDER = ['auto', 'light', 'dark'];
+
+/** Reads the persisted choice, defaulting to "auto" if unset or unreadable. */
+function storedTheme() {
+  try {
+    const value = localStorage.getItem(THEME_KEY);
+    return THEME_ORDER.includes(value) ? value : 'auto';
+  } catch (err) {
+    return 'auto';
+  }
+}
+
+/**
+ * Applies `mode` to the document: an explicit `data-theme` for "light"/"dark",
+ * or no attribute at all for "auto" so `prefers-color-scheme` takes over.
+ * Mirrors the inline bootstrap script in index.html, which does the same
+ * thing before this file has even loaded, to avoid a flash of the wrong theme.
+ */
+function applyTheme(mode) {
+  if (mode === 'light' || mode === 'dark') {
+    document.documentElement.setAttribute('data-theme', mode);
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+  }
+}
+
+function updateThemeButton(mode) {
+  const button = el('btn-theme');
+  const label = t(`web.theme.${mode}`);
+  button.textContent = label;
+  button.setAttribute('aria-label', t('web.theme.toggle_label', { mode: label }));
+}
+
+function setTheme(mode) {
+  try {
+    localStorage.setItem(THEME_KEY, mode);
+  } catch (err) { /* localStorage unavailable: the choice just won't persist */ }
+  applyTheme(mode);
+  updateThemeButton(mode);
+}
+
+el('btn-theme').addEventListener('click', () => {
+  const next = THEME_ORDER[(THEME_ORDER.indexOf(storedTheme()) + 1) % THEME_ORDER.length];
+  setTheme(next);
+});
 
 // ------------------------------------------------------------------ model --
 
@@ -179,6 +243,7 @@ function render() {
     node.dataset.name = o.name;
     if (o.name === selected) node.classList.add('selected');
     if (!o.enabled) node.classList.add('disabled');
+    if (o.mirror_of) node.classList.add('mirrored');
     if (conflicting(o.name)) node.classList.add('conflict');
 
     const w = Math.max(lw * view.scale, 54);
@@ -495,6 +560,10 @@ function adopt(state) {
   el('profile-badge').textContent = state.activeProfile ? t('web.profile_badge', { name: state.activeProfile }) : '';
   showGuard(state.revertPending, state.confirmTimeoutSecs);
   render();
+  // `state.history` (pushed over SSE) only carries the raw snapshot fields;
+  // the formatted labels this panel needs come from GET /api/history, so we
+  // re-fetch it here rather than duplicating the server's age/summary logic.
+  refreshHistory();
 }
 
 function showGuard(pending, seconds) {
@@ -609,11 +678,77 @@ async function refresh() {
   }
 }
 
+// ---------------------------------------------------------------- history --
+
+/**
+ * Pulls the formatted history listing (age label and summary are computed
+ * server-side, in the user's language — see GET /api/history). Called
+ * whenever a fresh state arrives over SSE, rather than on a timer: the
+ * daemon already tells us when something changed, so a separate poll loop
+ * would be redundant.
+ */
+async function refreshHistory() {
+  try {
+    renderHistory(await api('/api/history'));
+  } catch (err) {
+    console.error('history unavailable', err);
+  }
+}
+
+function renderHistory(data) {
+  const list = el('history-list');
+  const empty = el('history-empty');
+  const entries = (data.entries ?? []).slice(0, 5);
+
+  el('history-remembered').textContent = t('web.history.remembered', { count: data.remembered ?? 0 });
+
+  list.innerHTML = '';
+  empty.hidden = entries.length > 0;
+  list.hidden = entries.length === 0;
+
+  for (const entry of entries) {
+    const item = document.createElement('li');
+    item.className = 'history-entry';
+
+    const meta = document.createElement('div');
+    meta.className = 'history-meta';
+    meta.append(
+      node('span', entry.profile ? t('web.profile_badge', { name: entry.profile }) : t('web.history.origin_manual'), 'history-origin'),
+      node('span', entry.when, 'history-when'),
+    );
+
+    const restore = document.createElement('button');
+    restore.textContent = t('web.history.restore');
+    restore.setAttribute('aria-label', t('web.history.restore_aria', { when: entry.when }));
+    restore.addEventListener('click', () => restoreHistoryEntry(entry.index));
+
+    item.append(meta, node('div', entry.summary, 'history-summary'), restore);
+    list.append(item);
+  }
+}
+
+/**
+ * Restoring is exactly like applying a layout: the daemon re-arms the
+ * revert guard, so we just refresh the state and let the existing guard
+ * banner (see showGuard) do its usual thing — nothing to reimplement here.
+ */
+async function restoreHistoryEntry(index) {
+  try {
+    const res = await api(`/api/history/${index}/restore`, { method: 'POST' });
+    dirty = false;
+    toast(t('web.history.restored', { index: res.restored, when: res.when }));
+    await refresh();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
 window.addEventListener('resize', () => render());
 
 async function start() {
   await loadI18n();
   applyStaticI18n();
+  updateThemeButton(storedTheme());
   await refresh();
   connect();
 }

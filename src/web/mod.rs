@@ -63,6 +63,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/profiles/{name}", put(put_profile))
         .route("/api/profiles/{name}", delete(delete_profile))
         .route("/api/profiles/{name}/apply", post(apply_profile))
+        .route("/api/history", get(get_history))
+        .route("/api/history/{index}/restore", post(restore_history))
         .route("/api/events", get(sse_events))
         .route("/api/i18n", get(get_i18n))
         .fallback(static_handler)
@@ -231,6 +233,42 @@ async fn apply_profile(
     Ok(axum::Json(json!(report)))
 }
 
+async fn get_history(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    let store = state.store.lock().await;
+    // The age is computed server-side so the UI needs no clock of its own and
+    // cannot drift from what the CLI shows.
+    let entries: Vec<serde_json::Value> = store
+        .history
+        .iter()
+        .enumerate()
+        .map(|(index, s)| {
+            json!({
+                "index": index,
+                "when": s.age_label(),
+                "profile": s.profile,
+                "summary": s.describe(),
+                "layout": s.layout,
+            })
+        })
+        .collect();
+    Ok(axum::Json(
+        json!({ "entries": entries, "remembered": store.recall.len() }),
+    ))
+}
+
+async fn restore_history(
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<usize>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    let snapshot = state.restore(index).await?;
+    Ok(axum::Json(json!({
+        "restored": index,
+        "when": snapshot.age_label(),
+    })))
+}
+
 /// State stream pushed to clients: hotplug, apply, revert.
 async fn sse_events(
     State(state): State<Arc<AppState>>,
@@ -292,6 +330,17 @@ const WEB_KEYS: &[&str] = &[
     "web.issue.all_disabled",
     "web.issue.mirror_unavailable",
     "web.not_found",
+    "web.theme.toggle_label",
+    "web.theme.auto",
+    "web.theme.light",
+    "web.theme.dark",
+    "web.history.title",
+    "web.history.empty",
+    "web.history.remembered",
+    "web.history.origin_manual",
+    "web.history.restore",
+    "web.history.restore_aria",
+    "web.history.restored",
 ];
 
 /// Serves the strings the UI needs for the active locale.
@@ -376,6 +425,47 @@ mod tests {
             .await
             .expect_err("an unknown profile must fail");
         assert!(format!("{:#}", err.0).contains("unknown profile"));
+    }
+
+    /// The locale file, read at compile time so the checks below cannot drift
+    /// from what actually ships.
+    const LOCALES: &str = include_str!("../../locales/app.yml");
+
+    #[test]
+    fn every_served_key_has_a_translation() {
+        // rust-i18n echoes the key back when it is missing, which would ship a
+        // raw `web.action.apply` to the UI instead of a label.
+        for key in WEB_KEYS {
+            for locale in crate::i18n::AVAILABLE {
+                let value = rust_i18n::t!(*key, locale = *locale);
+                assert_ne!(
+                    value, *key,
+                    "key {key} has no {locale} translation in locales/app.yml"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_web_key_in_the_locale_file_is_actually_served() {
+        // Adding a key to locales/app.yml is not enough: /api/i18n only sends
+        // what WEB_KEYS lists, so a forgotten entry silently stays English.
+        let declared: Vec<&str> = LOCALES
+            .lines()
+            .filter_map(|l| l.strip_suffix(':'))
+            .filter(|k| k.starts_with("web."))
+            .collect();
+
+        assert!(
+            !declared.is_empty(),
+            "no web.* key found in the locale file"
+        );
+        for key in declared {
+            assert!(
+                WEB_KEYS.contains(&key),
+                "{key} is translated but missing from WEB_KEYS, so the UI never receives it"
+            );
+        }
     }
 
     #[tokio::test]

@@ -16,10 +16,11 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 use hyprdmc::apply::{self, ApplyReport};
 use hyprdmc::browser;
-use hyprdmc::cli::{Cli, Command, ProfileAction, SafetyArgs, SetArgs, WebArgs};
+use hyprdmc::cli::{Cli, Command, HistoryAction, ProfileAction, SafetyArgs, SetArgs, WebArgs};
 use hyprdmc::config::{Config, OutputRule, Profile, config_path, hyprland_conf, parse_position};
 use hyprdmc::daemon::{self, AppState};
 use hyprdmc::emit;
+use hyprdmc::history::Store;
 use hyprdmc::ipc::{HyprBackend, HyprSocket};
 use hyprdmc::layout::{Layout, Relation, Severity, format_scale};
 use hyprdmc::monitor::{Mode, Monitor, Rotation, Transform};
@@ -45,6 +46,7 @@ async fn main() -> Result<()> {
         Command::Profile { action } => cmd_profile(action),
         Command::Apply { safety } => cmd_apply_for_hardware(safety),
         Command::Persist => cmd_persist(),
+        Command::History { action } => cmd_history(action),
         Command::Init { dry_run } => cmd_init(dry_run),
         Command::Daemon { web, no_web } => cmd_daemon(web, !no_web).await,
         Command::Web { web } => cmd_web(web).await,
@@ -233,7 +235,7 @@ fn cmd_set(args: SetArgs) -> Result<()> {
         }
     }
 
-    apply_interactively(&hypr, &layout, args.safety)?;
+    apply_interactively(&hypr, &layout, args.safety, None)?;
 
     if let Some(name) = &args.save {
         save_profile(name, false, &layout, &monitors)?;
@@ -255,19 +257,24 @@ fn cmd_arrange(spec: &[String], safety: SafetyArgs) -> Result<()> {
     }
     layout.normalize();
 
-    apply_interactively(&hypr, &layout, safety)
+    apply_interactively(&hypr, &layout, safety, None)
 }
 
 fn cmd_auto(safety: SafetyArgs) -> Result<()> {
     let hypr = backend()?;
     let mut layout = Layout::from_monitors(&hypr.monitors()?);
     layout.auto_arrange();
-    apply_interactively(&hypr, &layout, safety)
+    apply_interactively(&hypr, &layout, safety, None)
 }
 
 /// Applies a layout then, in a terminal, offers to revert — this is what
 /// avoids being stuck in front of a black screen.
-fn apply_interactively(hypr: &HyprSocket, layout: &Layout, safety: SafetyArgs) -> Result<()> {
+fn apply_interactively(
+    hypr: &HyprSocket,
+    layout: &Layout,
+    safety: SafetyArgs,
+    profile: Option<&str>,
+) -> Result<()> {
     let previous = apply::snapshot(hypr)?;
     let report = apply::apply(hypr, layout, safety.force)?;
     print_report(&report);
@@ -275,14 +282,103 @@ fn apply_interactively(hypr: &HyprSocket, layout: &Layout, safety: SafetyArgs) -
     if report.rolled_back {
         bail!(t!("apply.not_applied").to_string());
     }
-    if safety.no_confirm {
+
+    // Skipping the prompt means "do not ask", not "do not record": a layout
+    // applied with --no-confirm is still one the user may want to undo.
+    if !safety.no_confirm {
+        let timeout = Duration::from_secs(Config::load()?.settings.confirm_timeout_secs);
+        if !apply::confirm_or_revert(hypr, &previous, timeout)? {
+            println!("{}", t!("apply.reverted"));
+            return Ok(());
+        }
+    }
+
+    // Only file a layout that survived: the history is an undo list, and an
+    // entry the user already rejected has no business in it.
+    remember(hypr, layout, profile);
+    Ok(())
+}
+
+/// Files an applied layout in the history and the recall map.
+///
+/// Best-effort: failing to record must not turn a successful apply into an
+/// error, so problems are logged and swallowed.
+fn remember(hypr: &HyprSocket, layout: &Layout, profile: Option<&str>) {
+    let Ok(monitors) = hypr.monitors() else {
+        return;
+    };
+    let mut store = Store::load();
+    store.record(hyprdmc::history::Snapshot::new(
+        layout.clone(),
+        hyprdmc::history::signature(&monitors),
+        profile.map(str::to_string),
+    ));
+    if let Err(err) = store.save() {
+        tracing::warn!("could not record the layout: {err:#}");
+    }
+}
+
+// ---------------------------------------------------------------- history --
+
+fn cmd_history(action: Option<HistoryAction>) -> Result<()> {
+    match action.unwrap_or(HistoryAction::List) {
+        HistoryAction::List => cmd_history_list(),
+
+        HistoryAction::Restore { index, safety } => {
+            let store = Store::load();
+            let snapshot = store
+                .entry(index)
+                .ok_or_else(|| anyhow!(t!("history.unknown_entry", index = index).to_string()))?;
+            let when = snapshot.age_label();
+            let hypr = backend()?;
+            apply_interactively(&hypr, &snapshot.layout, safety, snapshot.profile.as_deref())?;
+            println!("{}", t!("history.restored", index = index, when = when));
+            Ok(())
+        }
+
+        HistoryAction::Clear => {
+            let mut store = Store::load();
+            store.clear();
+            store.save()?;
+            println!("{}", t!("history.cleared"));
+            Ok(())
+        }
+    }
+}
+
+fn cmd_history_list() -> Result<()> {
+    let store = Store::load();
+    if store.history.is_empty() {
+        println!("{}", t!("history.empty"));
         return Ok(());
     }
 
-    let timeout = Duration::from_secs(Config::load()?.settings.confirm_timeout_secs);
-    if !apply::confirm_or_revert(hypr, &previous, timeout)? {
-        println!("{}", t!("apply.reverted"));
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            t!("history.table.position").to_string(),
+            t!("history.table.when").to_string(),
+            t!("history.table.origin").to_string(),
+            t!("history.table.layout").to_string(),
+        ]);
+
+    for (index, snapshot) in store.history.iter().enumerate() {
+        table.add_row(vec![
+            Cell::new(index),
+            Cell::new(snapshot.age_label()),
+            Cell::new(
+                snapshot
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| t!("history.origin.manual").to_string()),
+            ),
+            Cell::new(snapshot.describe()),
+        ]);
     }
+    println!("{table}");
+    println!("{}", t!("history.recall_known", count = store.recall.len()));
     Ok(())
 }
 
@@ -335,7 +431,7 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
                 .profile(&name)
                 .ok_or_else(|| anyhow!(t!("config.unknown_profile", name = name).to_string()))?;
             let layout = profile.resolve(&monitors)?;
-            apply_interactively(&hypr, &layout, safety)
+            apply_interactively(&hypr, &layout, safety, Some(&name))
         }
 
         ProfileAction::Delete { name } => {
@@ -436,9 +532,11 @@ fn cmd_apply_for_hardware(safety: SafetyArgs) -> Result<()> {
     let monitors = hypr.monitors()?;
     let cfg = Config::load()?;
 
+    let mut chosen: Option<String> = None;
     let layout = match cfg.best_match(&monitors) {
         Some(profile) => {
             println!("{}", t!("cli.matching_profile", name = &profile.name));
+            chosen = Some(profile.name.clone());
             profile.resolve(&monitors)?
         }
         None => {
@@ -448,7 +546,7 @@ fn cmd_apply_for_hardware(safety: SafetyArgs) -> Result<()> {
             layout
         }
     };
-    apply_interactively(&hypr, &layout, safety)
+    apply_interactively(&hypr, &layout, safety, chosen.as_deref())
 }
 
 // ----------------------------------------------------------------- persistence --

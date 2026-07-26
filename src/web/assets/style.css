@@ -1,7 +1,19 @@
+/*
+ * Theme architecture: every colour is a variable, resolved in three layers
+ * (later layers win):
+ *   1. `:root`                       — dark, the default.
+ *   2. `@media (prefers-color-scheme: light)` — the OS says light, and the
+ *      user has not overridden it ("auto" mode).
+ *   3. `:root[data-theme="light"|"dark"]` — an explicit choice made with the
+ *      theme toggle (see app.js), persisted in localStorage. Both selectors
+ *      carry higher specificity than the plain `:root` used inside the media
+ *      query, so the explicit choice always wins regardless of the OS setting.
+ */
 :root {
   --bg: #16181d;
   --surface: #1e2128;
   --surface-2: #262a33;
+  --surface-2-hi: #2f3440;
   --border: #333846;
   --text: #e6e8ee;
   --muted: #9aa1b1;
@@ -10,6 +22,10 @@
   --danger: #e06c75;
   --warn: #e5c07b;
   --ok: #98c379;
+  --mirror: #b394f0;
+  --shadow-soft: rgba(0, 0, 0, .22);
+  --shadow-strong: rgba(0, 0, 0, .4);
+  --sheen: rgba(255, 255, 255, .05);
   --radius: 8px;
 }
 
@@ -18,6 +34,7 @@
     --bg: #f4f5f7;
     --surface: #ffffff;
     --surface-2: #eceef2;
+    --surface-2-hi: #ffffff;
     --border: #d3d7e0;
     --text: #1c1f26;
     --muted: #5c6472;
@@ -26,7 +43,49 @@
     --danger: #c0392b;
     --warn: #9a6d00;
     --ok: #3f7d20;
+    --mirror: #7c4fd1;
+    --shadow-soft: rgba(30, 41, 59, .1);
+    --shadow-strong: rgba(30, 41, 59, .2);
+    --sheen: rgba(255, 255, 255, .65);
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #16181d;
+  --surface: #1e2128;
+  --surface-2: #262a33;
+  --surface-2-hi: #2f3440;
+  --border: #333846;
+  --text: #e6e8ee;
+  --muted: #9aa1b1;
+  --accent: #62aeef;
+  --accent-ink: #0d1117;
+  --danger: #e06c75;
+  --warn: #e5c07b;
+  --ok: #98c379;
+  --mirror: #b394f0;
+  --shadow-soft: rgba(0, 0, 0, .22);
+  --shadow-strong: rgba(0, 0, 0, .4);
+  --sheen: rgba(255, 255, 255, .05);
+}
+
+:root[data-theme="light"] {
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-2: #eceef2;
+  --surface-2-hi: #ffffff;
+  --border: #d3d7e0;
+  --text: #1c1f26;
+  --muted: #5c6472;
+  --accent: #2f6fb5;
+  --accent-ink: #ffffff;
+  --danger: #c0392b;
+  --warn: #9a6d00;
+  --ok: #3f7d20;
+  --mirror: #7c4fd1;
+  --shadow-soft: rgba(30, 41, 59, .1);
+  --shadow-strong: rgba(30, 41, 59, .2);
+  --sheen: rgba(255, 255, 255, .65);
 }
 
 * { box-sizing: border-box; }
@@ -56,6 +115,8 @@ footer {
   flex-wrap: wrap;
 }
 
+.app-icon { display: block; flex-shrink: 0; border-radius: 6px; }
+
 h1 { font-size: 1.05rem; margin: 0; letter-spacing: .02em; }
 .spacer { flex: 1; }
 
@@ -65,6 +126,13 @@ h1 { font-size: 1.05rem; margin: 0; letter-spacing: .02em; }
   background: var(--surface-2);
   color: var(--muted);
   font-size: .8rem;
+}
+
+.theme-toggle {
+  padding: .3rem .65rem;
+  border-radius: 99px;
+  font-size: .78rem;
+  min-width: 3.4rem;
 }
 
 .dot {
@@ -110,7 +178,10 @@ main {
   justify-content: center;
   gap: .15rem;
   padding: .25rem;
-  background: var(--surface-2);
+  /* A soft diagonal sheen plus a two-layer shadow, so each output reads as a
+     small physical object sitting above the grid rather than a flat tile —
+     restrained on purpose, this is a utility, not a landing page. */
+  background: linear-gradient(155deg, var(--surface-2-hi), var(--surface-2) 65%);
   border: 2px solid var(--border);
   border-radius: 6px;
   cursor: grab;
@@ -118,29 +189,93 @@ main {
   overflow: hidden;
   text-align: center;
   touch-action: none;
+  box-shadow: 0 1px 2px var(--shadow-soft), 0 6px 14px var(--shadow-soft), inset 0 1px 0 var(--sheen);
+  transition: box-shadow .15s ease, border-color .15s ease, transform .15s ease;
 }
-.screen:hover { border-color: var(--muted); }
-.screen.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--surface-2)); }
-.screen.dragging { cursor: grabbing; z-index: 10; }
-.screen.disabled { opacity: .42; border-style: dashed; }
-.screen.conflict { border-color: var(--danger); }
+.screen:hover { border-color: var(--muted); transform: translateY(-1px); }
+
+/* Each state is told apart by hue, not just opacity, so several states
+   stacking on one output (e.g. a disabled mirror) stay distinguishable. */
+.screen.selected {
+  border-color: var(--accent);
+  background: linear-gradient(155deg, color-mix(in srgb, var(--accent) 20%, var(--surface-2-hi)), color-mix(in srgb, var(--accent) 12%, var(--surface-2)) 65%);
+}
+.screen.mirrored {
+  border-color: var(--mirror);
+  background: linear-gradient(155deg, color-mix(in srgb, var(--mirror) 22%, var(--surface-2-hi)), color-mix(in srgb, var(--mirror) 14%, var(--surface-2)) 65%);
+}
+.screen.disabled {
+  border-style: dashed;
+  border-color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 14%, var(--surface-2));
+  box-shadow: none;
+  opacity: .7;
+}
+.screen.conflict {
+  border-color: var(--danger);
+  background: linear-gradient(155deg, color-mix(in srgb, var(--danger) 26%, var(--surface-2-hi)), color-mix(in srgb, var(--danger) 16%, var(--surface-2)) 65%);
+}
+.screen.dragging { cursor: grabbing; z-index: 10; transform: none; box-shadow: 0 10px 24px var(--shadow-strong); }
 
 .screen .name { font-weight: 600; font-size: .85rem; }
 .screen .detail { font-size: .72rem; color: var(--muted); }
 
 .hint { color: var(--muted); font-size: .82rem; margin: .5rem 0 0; }
 
-.panel {
+.side {
   flex: 0 1 300px;
   min-width: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.panel, .history {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 1rem;
 }
-.panel .empty { color: var(--muted); margin: 0; }
+.panel .empty, .history .empty { color: var(--muted); margin: 0; font-size: .85rem; }
 .panel h2 { font-size: .95rem; margin: 0 0 .2rem; }
 .panel .sub { color: var(--muted); font-size: .8rem; margin: 0 0 1rem; word-break: break-word; }
+
+.history-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .5rem;
+  margin-bottom: .6rem;
+}
+.history-head h2 { font-size: .95rem; margin: 0; }
+.muted { color: var(--muted); font-size: .75rem; }
+
+.history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+}
+.history-entry {
+  display: flex;
+  flex-direction: column;
+  gap: .3rem;
+  padding: .5rem .6rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.history-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: .5rem;
+  font-size: .75rem;
+  color: var(--muted);
+}
+.history-summary { font-size: .78rem; word-break: break-word; }
+.history-entry button { align-self: flex-start; padding: .25rem .6rem; font-size: .78rem; }
 
 .field { margin-bottom: .85rem; }
 .field > label { display: block; font-size: .78rem; color: var(--muted); margin-bottom: .25rem; }
@@ -219,7 +354,15 @@ button.danger { color: var(--danger); }
   border-radius: var(--radius);
   background: var(--surface-2);
   border: 1px solid var(--border);
-  box-shadow: 0 6px 20px rgb(0 0 0 / .3);
+  box-shadow: 0 6px 20px var(--shadow-strong);
   max-width: min(90vw, 40rem);
 }
 .toast.error { border-color: var(--danger); color: var(--danger); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+  .screen:hover { transform: none; }
+}

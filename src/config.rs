@@ -30,6 +30,11 @@ pub struct Settings {
     /// locale"; see [`crate::i18n`] for the full resolution order.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Announce hotplug changes and applied profiles on the desktop.
+    pub notifications: bool,
+    /// Reuse the layout last applied with the same set of outputs when no
+    /// named profile matches. This is what makes redocking just work.
+    pub remember: bool,
 }
 
 impl Default for Settings {
@@ -41,6 +46,8 @@ impl Default for Settings {
             confirm_timeout_secs: 10,
             monitors_conf: default_monitors_conf(),
             language: None,
+            notifications: true,
+            remember: true,
         }
     }
 }
