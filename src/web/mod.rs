@@ -360,21 +360,60 @@ async fn get_i18n() -> axum::Json<serde_json::Value> {
     }))
 }
 
-async fn static_handler(uri: Uri) -> Response {
+/// Serves an embedded asset, with revalidation.
+///
+/// These files are baked into the binary, so they change exactly when the
+/// binary is rebuilt — and a browser that heuristically caches them keeps
+/// running yesterday's UI against today's daemon, which looks like a bug in
+/// the daemon. `no-cache` forces a revalidation on every load; the content
+/// hash as `ETag` makes that revalidation cheap by answering `304` while
+/// nothing has changed.
+async fn static_handler(headers: axum::http::HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
-    match Assets::get(path) {
-        Some(file) => {
-            let mime = file.metadata.mimetype().to_string();
-            ([(header::CONTENT_TYPE, mime)], file.data.into_owned()).into_response()
-        }
-        None => (
+    let Some(file) = Assets::get(path) else {
+        return (
             StatusCode::NOT_FOUND,
             rust_i18n::t!("web.not_found").into_owned(),
         )
-            .into_response(),
+            .into_response();
+    };
+
+    let etag = etag_for(&file.metadata.sha256_hash());
+    let unchanged = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|sent| sent.split(',').any(|candidate| candidate.trim() == etag));
+
+    let common = [
+        (header::CACHE_CONTROL, "no-cache".to_string()),
+        (header::ETAG, etag),
+    ];
+
+    if unchanged {
+        return (StatusCode::NOT_MODIFIED, common).into_response();
     }
+
+    let mime = file.metadata.mimetype().to_string();
+    (
+        common,
+        [(header::CONTENT_TYPE, mime)],
+        file.data.into_owned(),
+    )
+        .into_response()
+}
+
+/// Renders a content hash as a quoted entity tag.
+fn etag_for(hash: &[u8; 32]) -> String {
+    let mut tag = String::with_capacity(2 + 32);
+    tag.push('"');
+    // 8 bytes are ample to tell two builds apart and keep the header short.
+    for byte in &hash[..8] {
+        tag.push_str(&format!("{byte:02x}"));
+    }
+    tag.push('"');
+    tag
 }
 
 #[cfg(test)]
@@ -382,6 +421,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::ipc::fake::FakeBackend;
+    use axum::http::HeaderMap;
 
     const MONITORS: &str = r#"[
       {"id":0,"name":"eDP-1","description":"AU Optronics 0x5799","make":"AU Optronics",
@@ -481,8 +521,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assets_are_revalidated_rather_than_cached_blindly() {
+        // A browser holding yesterday's app.js against today's daemon looks
+        // exactly like a broken daemon, so these must never be cached without
+        // a revalidation.
+        let resp = static_handler(HeaderMap::new(), "/app.js".parse::<Uri>().unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert!(resp.headers().get(header::ETAG).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_asset_answers_304() {
+        let uri = "/app.js".parse::<Uri>().unwrap();
+        let first = static_handler(HeaderMap::new(), uri.clone()).await;
+        let etag = first.headers().get(header::ETAG).unwrap().clone();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag);
+        let second = static_handler(headers, uri).await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn a_stale_etag_gets_the_new_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_NONE_MATCH,
+            "\"0000000000000000\"".parse().unwrap(),
+        );
+        let resp = static_handler(headers, "/app.js".parse::<Uri>().unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn different_assets_get_different_etags() {
+        let js = static_handler(HeaderMap::new(), "/app.js".parse::<Uri>().unwrap()).await;
+        let css = static_handler(HeaderMap::new(), "/style.css".parse::<Uri>().unwrap()).await;
+        assert_ne!(
+            js.headers().get(header::ETAG),
+            css.headers().get(header::ETAG)
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_asset_yields_404() {
-        let resp = static_handler("/absent.js".parse::<Uri>().unwrap()).await;
+        let resp = static_handler(HeaderMap::new(), "/absent.js".parse::<Uri>().unwrap()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
