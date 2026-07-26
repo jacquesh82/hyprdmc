@@ -3,16 +3,101 @@
 Definitions for the three families, plus what it actually takes to get each one
 into a repository people can install from.
 
-| Family | Files | Built and verified here |
-|---|---|---|
-| Arch | [`arch/PKGBUILD`](arch/PKGBUILD) | **yes** — `makepkg` produced a 2.0 MB package, tests included |
-| Fedora / RHEL | [`rpm/hyprdmc.spec`](rpm/hyprdmc.spec) | no — `rpmbuild` is not installed on the machine this was written on |
-| Debian / Ubuntu | [`debian/`](debian/) | no — `dpkg-buildpackage` likewise |
-| any | [`systemd/hyprdmc.service`](systemd/hyprdmc.service) | reference user unit, installed by all three |
+| Family | Files |
+|---|---|
+| Arch | [`arch/PKGBUILD`](arch/PKGBUILD) |
+| Fedora / RHEL | [`rpm/hyprdmc.spec`](rpm/hyprdmc.spec) |
+| Debian / Ubuntu | [`debian/`](debian/) |
+| any | [`systemd/hyprdmc.service`](systemd/hyprdmc.service) |
 
 All three install the same two things: `/usr/bin/hyprdmc`, and the systemd
 **user** unit in `/usr/lib/systemd/user/`. Nothing runs as root — the daemon
 drives one login session's displays and talks to that session's socket.
+
+## Build them, from any distribution
+
+```sh
+./packaging/build-in-container.sh          # both, into dist/
+./packaging/build-in-container.sh deb      # just one
+```
+
+The `.deb` and the `.rpm` are built **inside containers of the target
+distributions**, and that is not a convenience: a `.deb` built on an Arch
+machine links against Arch's glibc and breaks on Debian. Containers also mean
+nothing gets installed on the machine you run this from — no `rpmbuild`, no
+`debhelper`, no `sudo`. Either podman or docker will do.
+
+The Arch package is built natively, since Arch is where `makepkg` belongs:
+
+```sh
+cd packaging/arch && updpkgsums && makepkg -si
+```
+
+## Minimum Rust version, and what it costs Debian
+
+The crate needs **rustc 1.88**: two `let` chains in `src/daemon.rs` and
+`src/monitor.rs`, and one in the `ignore` crate, which is a dependency. That
+number is not decorative — `Cargo.toml` declared 1.87 until a build against
+exactly 1.87 proved otherwise.
+
+The consequence is entirely on Debian's side:
+
+| | rustc | builds |
+|---|---|---|
+| Debian 13 stable (trixie) | 1.85 | **no** |
+| Debian unstable (sid) | 1.95 | yes |
+| Fedora 42 | 1.95 | yes |
+| Arch | current | yes |
+
+This is less of a problem than it looks: new packages enter Debian through
+*unstable*, never through stable, so unstable is the correct target anyway.
+Stable users get it through backports, or through the vendored build in
+`build-in-container.sh`.
+
+## Two traps, both already sprung here
+
+**`dh_clean` deletes every `*.orig` in the tree** — including the
+`Cargo.toml.orig` that `cargo vendor` writes into each vendored crate. The
+build then fails with `failed to calculate checksum of:
+vendor/anyhow/Cargo.toml.orig`. `debian/rules` overrides it with
+`dh_clean -X.orig`.
+
+**`%autorelease` and `%autochangelog` only resolve inside `fedpkg`.** They are
+what Fedora's own packages use, but a plain `rpmbuild -ba` on a clone — which
+is what COPR does, and what anyone reading this repository will do — fails on
+them. The spec carries an explicit `Release:` and `%changelog` instead.
+
+## What the linters say
+
+`build-in-container.sh` runs `lintian` and `rpmlint` on what it produced. What
+is left is expected, and listed here so nobody has to wonder whether it was
+looked at.
+
+| Tool | Message | Why it stays |
+|---|---|---|
+| both | no manual page | Real gap. Debian policy says every binary should have one; generating it means adding `clap_mangen` as a build dependency and a `build.rs`. |
+| rpmlint | `spelling-error … hotplug` | rpmlint's dictionary does not know the word. It is the correct term and the one the rest of the documentation uses. |
+| lintian | `initial-upload-closes-no-bugs` | Only meaningful inside the Debian archive, where a first upload closes the ITP bug. |
+| lintian | `debug-file-with-no-debug-symbols` | The `-dbgsym` package `dh` builds automatically from a release binary that carries none. |
+
+Two findings were real and are fixed: a changelog dated Saturday for a day that
+is a Sunday, and `%cargo_install` copying the crate sources into
+`%{cargo_registry}` — this crate has a lib target beside its binary, and the
+unpackaged files were a hard `rpmbuild` error.
+
+## What was actually built
+
+Not "should build". These came out of the containers:
+
+```
+hyprdmc-0.1.0-1.fc42.x86_64.rpm        1.6 MB
+hyprdmc_0.1.0-1_amd64.deb              1.5 MB
+hyprdmc-0.1.0-1-x86_64.pkg.tar.zst     2.0 MB
+```
+
+Each contains `/usr/bin/hyprdmc`, the systemd user unit, the licence and the
+README — and nothing else. The RPM and the Arch package run the full test suite
+during the build, so a broken tree cannot be packaged.
 
 ## Before any of it: tag a release
 
@@ -160,15 +245,21 @@ and a GitHub Release with prebuilt `x86_64` / `aarch64` binaries, which the AUR
 `-bin` package convention can then wrap for people who do not want to compile
 Rust.
 
-## Vendoring, if a build host has no network
+## Vendoring
 
-Both the RPM spec and `debian/rules` can build offline when the source ships
-its dependencies:
+Both the RPM and the Debian package build from vendored crates, which is what
+Fedora's builders, Launchpad and OBS require — none of them let a build reach
+crates.io.
 
 ```sh
-mkdir -p .cargo && cargo vendor > .cargo/config.toml
-tar czf hyprdmc-0.1.0-vendor.tar.gz vendor .cargo
+./packaging/vendor.sh 0.1.0      # -> hyprdmc-0.1.0-vendor.tar.xz (~16 MB)
 ```
 
-Add that as a second `Source` and pass `--offline` to `cargo build`. Some build
-services (Launchpad, and OBS by default) require it.
+`--locked` is not optional there: the tarball has to match `Cargo.lock`
+exactly, or the offline build inside the package silently resolves something
+else. The RPM takes it as `Source1`; the Debian build unpacks it next to a
+`.cargo/config.toml` pointing at `vendor/`.
+
+For Fedora, every bundled crate must be declared so that a CVE in a dependency
+can find this package: `%cargo_vendor_manifest` in the spec generates that list
+at build time.

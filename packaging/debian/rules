@@ -27,3 +27,9 @@ override_dh_auto_install:
 
 override_dh_auto_clean:
 	rm -rf target debian/cargo
+
+# dh_clean deletes every *.orig it finds in the tree. With vendored crates that
+# means the Cargo.toml.orig of each one, and cargo then refuses to build:
+# "failed to calculate checksum of: vendor/anyhow/Cargo.toml.orig".
+override_dh_clean:
+	dh_clean -X.orig

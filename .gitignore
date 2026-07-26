@@ -6,3 +6,8 @@
 /CLAUDE.md
 /CONTEXT.md
 .dual-graph/
+
+# Produits de packaging
+/dist/
+/hyprdmc-*-vendor.tar.xz
+/vendor/

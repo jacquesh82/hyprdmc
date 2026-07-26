@@ -2,7 +2,7 @@
 name = "hyprdmc"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 description = "Hypr Dynamic Monitor Configuration: detect, position, rotate and flip Hyprland displays from a CLI or a browser, with automatic hotplug profiles."
 authors = ["Jacques Hullu <jacques@hullu.fr>"]
 license = "MIT"
