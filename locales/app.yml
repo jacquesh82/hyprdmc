@@ -559,3 +559,9 @@ web.history.restore_aria:
 web.history.restored:
   en: "Configuration #%{index} restored (%{when})."
   fr: "Configuration n°%{index} restaurée (%{when})."
+web.no_outputs:
+  en: "No display detected."
+  fr: "Aucun écran détecté."
+web.disconnected:
+  en: "Daemon unreachable — is hyprdmc still running?"
+  fr: "Démon injoignable — hyprdmc tourne-t-il toujours ?"

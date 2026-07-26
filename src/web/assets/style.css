@@ -366,3 +366,18 @@ button.danger { color: var(--danger); }
   }
   .screen:hover { transform: none; }
 }
+
+/* Shown in place of the outputs when there are none to draw, so an empty
+   canvas never reads as a broken one. */
+.canvas-note {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 1rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: .9rem;
+}

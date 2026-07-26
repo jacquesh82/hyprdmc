@@ -341,6 +341,8 @@ const WEB_KEYS: &[&str] = &[
     "web.history.restore",
     "web.history.restore_aria",
     "web.history.restored",
+    "web.no_outputs",
+    "web.disconnected",
 ];
 
 /// Serves the strings the UI needs for the active locale.

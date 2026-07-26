@@ -58,14 +58,14 @@ const I18N_DEFAULTS = {
   'web.issue.all_disabled': 'every output would be disabled',
   'web.issue.mirror_unavailable': '"%{name}" mirrors an unavailable output',
   'web.not_found': 'not found',
-  // Theme toggle. Not yet in locales/app.yml nor in the WEB_KEYS whitelist
-  // served by /api/i18n (see src/web/mod.rs) — until that lands, these
-  // English defaults are what every locale sees.
+  'web.no_outputs': 'No display detected.',
+  'web.disconnected': 'Daemon unreachable — is hyprdmc still running?',
+  // Theme toggle.
   'web.theme.toggle_label': 'Theme: %{mode}',
   'web.theme.auto': 'Auto',
   'web.theme.light': 'Light',
   'web.theme.dark': 'Dark',
-  // History panel. Same caveat: proposed keys, not wired server-side yet.
+  // History panel.
   'web.history.title': 'History',
   'web.history.empty': 'No layout applied yet.',
   'web.history.remembered': '%{count} layout(s) remembered',
@@ -216,14 +216,26 @@ function bounds() {
 }
 
 /** Scale factor and offset to fit the layout inside the frame. */
+/**
+ * Scale factor and offset to fit the layout inside the frame.
+ *
+ * Returns `null` while the canvas has no usable size. That happens for real:
+ * a tab opened in the background by `--open` can run this before its first
+ * layout, and `clientWidth` then reads 0. Without the guard the scale goes
+ * *negative*, every output is positioned outside the frame, and `overflow:
+ * hidden` makes the canvas look empty with nothing to hint why. The
+ * ResizeObserver below redraws as soon as a real size exists.
+ */
 function viewport() {
   const b = bounds();
   const pad = 24;
-  const k = Math.min(
-    (canvas.clientWidth - pad * 2) / Math.max(b.w, 1),
-    (canvas.clientHeight - pad * 2) / Math.max(b.h, 1),
-  );
-  const scale = Math.min(k, 0.5);
+  const usableW = canvas.clientWidth - pad * 2;
+  const usableH = canvas.clientHeight - pad * 2;
+  if (!(usableW > 0) || !(usableH > 0)) return null;
+
+  const scale = Math.min(usableW / Math.max(b.w, 1), usableH / Math.max(b.h, 1), 0.5);
+  if (!(scale > 0) || !Number.isFinite(scale)) return null;
+
   return {
     scale,
     ox: (canvas.clientWidth - b.w * scale) / 2 - b.x * scale,
@@ -233,7 +245,21 @@ function viewport() {
 
 function render() {
   const view = viewport();
+  // No usable size yet: leave whatever is on screen alone rather than
+  // replacing it with misplaced boxes. observeCanvas() calls us back.
+  if (!view) return;
   canvas.innerHTML = '';
+
+  // An empty canvas is indistinguishable from a broken one: say which it is.
+  if (!draft.length) {
+    const note = document.createElement('p');
+    note.className = 'canvas-note';
+    note.textContent = live ? t('web.no_outputs') : t('web.disconnected');
+    canvas.append(note);
+    renderPanel();
+    renderIssues();
+    return;
+  }
 
   // Disabled outputs are drawn last, underneath the others.
   for (const o of [...draft].sort((a, b) => Number(a.enabled) - Number(b.enabled))) {
@@ -289,6 +315,7 @@ function onPointerDown(event) {
   render();
 
   const view = viewport();
+  if (!view) return;
   const startX = event.clientX;
   const startY = event.clientY;
   const originX = o.x;
@@ -743,12 +770,25 @@ async function restoreHistoryEntry(index) {
   }
 }
 
-window.addEventListener('resize', () => render());
+/**
+ * Redraws whenever the canvas changes size — including the very first time it
+ * gets one. A `resize` listener alone is not enough: a window that opens at
+ * its final size never fires one, so a first render that happened before
+ * layout would stay wrong forever.
+ */
+function observeCanvas() {
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(() => render()).observe(canvas);
+    return;
+  }
+  window.addEventListener('resize', () => render());
+}
 
 async function start() {
   await loadI18n();
   applyStaticI18n();
   updateThemeButton(storedTheme());
+  observeCanvas();
   await refresh();
   connect();
 }
