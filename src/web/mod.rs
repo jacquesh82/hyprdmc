@@ -113,6 +113,10 @@ async fn get_monitors(
 #[serde(rename_all = "camelCase")]
 struct ApplyRequest {
     outputs: Vec<OutputState>,
+    /// Connector name of the main screen, `null` for none, absent to leave the
+    /// setting alone.
+    #[serde(default, deserialize_with = "stated")]
+    primary: Option<Option<String>>,
     #[serde(default)]
     force: bool,
     /// Arm the automatic revert (true by default from the UI).
@@ -124,15 +128,79 @@ fn yes() -> bool {
     true
 }
 
+/// Tells `"primary": null` — clear the main screen — apart from a request that
+/// never mentions it, which must leave the setting as it is.
+///
+/// A plain `Option<Option<T>>` collapses both to `None`; this is only called
+/// when the key is actually there, so absence keeps coming from `default`.
+fn stated<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(de).map(Some)
+}
+
+/// Applies a hand-edited layout.
+///
+/// The main screen is the one thing here that outlives the apply: it is a
+/// setting, not a position, so it is written to `config.toml` — otherwise the
+/// next hotplug would reconcile against the old choice and undo it. It is stored
+/// as the screen's fingerprint, like a profile rule, so it survives a change of
+/// connector, and only *after* Hyprland has kept the layout: a rolled-back apply
+/// must not leave a setting behind.
 async fn post_apply(
     State(state): State<Arc<AppState>>,
     axum::Json(req): axum::Json<ApplyRequest>,
 ) -> ApiResult<axum::Json<serde_json::Value>> {
-    let layout = Layout::new(req.outputs);
+    let wanted = req.primary.clone();
+    let layout = Layout::new(req.outputs).with_primary(wanted.clone().flatten());
     // No profile: the web UI edits a layout by hand. Saving it under a name is
     // a separate, deliberate action (PUT /api/profiles/{name}).
     let report = state.apply(layout, req.force, req.guard, None).await?;
+
+    if let Some(choice) = wanted
+        && report.succeeded()
+        && set_primary(&state, choice.as_deref()).await?
+    {
+        // `apply` already broadcast, but it did so before the setting was
+        // written: without this, clients would keep the old choice until their
+        // next refresh.
+        state.broadcast().await;
+    }
     Ok(axum::Json(json!(report)))
+}
+
+/// Records the main screen in `config.toml`, by fingerprint. Says whether
+/// anything changed.
+///
+/// A no-op when the choice already resolves to the same screen, so applying an
+/// unrelated change never rewrites the file.
+async fn set_primary(state: &Arc<AppState>, connector: Option<&str>) -> Result<bool> {
+    let monitors = state.monitors().await?;
+    let mut cfg = state.config.write().await;
+    if cfg.primary_output(&monitors).as_deref() == connector {
+        return Ok(false);
+    }
+    cfg.settings.primary = primary_setting(connector, &monitors);
+    cfg.save()?;
+    Ok(true)
+}
+
+/// What to write in `config.toml` for a chosen connector.
+///
+/// The screen's fingerprint when we can see it, so the choice survives a change
+/// of port; the string as given otherwise — that is either a pattern the user
+/// wrote by hand or a screen that has just been unplugged, and in both cases
+/// second-guessing it would lose their choice.
+fn primary_setting(
+    connector: Option<&str>,
+    monitors: &[crate::monitor::Monitor],
+) -> Option<String> {
+    connector.map(|name| {
+        monitors
+            .iter()
+            .find(|m| m.name == name)
+            .map_or_else(|| name.to_string(), crate::monitor::Monitor::fingerprint)
+    })
 }
 
 async fn post_confirm(
@@ -152,9 +220,12 @@ async fn post_revert(
 async fn post_persist(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<axum::Json<serde_json::Value>> {
-    let layout = Layout::from_monitors(&state.monitors().await?);
-    let path = state.config.read().await.settings.monitors_lua.clone();
-    emit::persist(&layout, &path)?;
+    let monitors = state.monitors().await?;
+    let cfg = state.config.read().await;
+    let layout = Layout::from_monitors(&monitors).with_primary(cfg.primary_output(&monitors));
+    let path = cfg.settings.monitors_lua.clone();
+    drop(cfg);
+    emit::persist(state.compositor, &layout, &path)?;
     Ok(axum::Json(json!({ "path": path })))
 }
 
@@ -318,11 +389,10 @@ async fn apply_profile(
 /// live is the truth, and a layout set by hand in `hyprland.lua` must show up
 /// here instead of being silently overwritten by a default.
 async fn get_input(State(state): State<Arc<AppState>>) -> ApiResult<axum::Json<serde_json::Value>> {
-    let backend = Arc::clone(&state.backend);
-    let current =
-        tokio::task::spawn_blocking(move || crate::input::InputConfig::read(backend.as_ref()))
-            .await
-            .map_err(anyhow::Error::from)??;
+    let session = Arc::clone(&state.session);
+    let current = tokio::task::spawn_blocking(move || session.read_input())
+        .await
+        .map_err(anyhow::Error::from)??;
     // Parsing the xkb rules means reading a ~100 kB file: off the executor,
     // like every other blocking call here.
     let catalog = tokio::task::spawn_blocking(crate::input::catalog)
@@ -347,9 +417,9 @@ async fn put_input(
 ) -> ApiResult<axum::Json<serde_json::Value>> {
     input.validate()?;
 
-    let backend = Arc::clone(&state.backend);
+    let session = Arc::clone(&state.session);
     let target = input.clone();
-    tokio::task::spawn_blocking(move || target.apply(backend.as_ref()))
+    tokio::task::spawn_blocking(move || session.apply_input(&target))
         .await
         .map_err(anyhow::Error::from)??;
 
@@ -359,19 +429,18 @@ async fn put_input(
     Ok(axum::Json(json!({ "applied": input })))
 }
 
-/// Writes `input.lua`, so the settings survive a compositor restart.
+/// Writes `inputs.lua`, so the settings survive a compositor restart.
 async fn persist_input(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<axum::Json<serde_json::Value>> {
-    let backend = Arc::clone(&state.backend);
+    let session = Arc::clone(&state.session);
     // The live state again, not `config.toml`: what gets written is what the
     // user is currently using.
-    let current =
-        tokio::task::spawn_blocking(move || crate::input::InputConfig::read(backend.as_ref()))
-            .await
-            .map_err(anyhow::Error::from)??;
+    let current = tokio::task::spawn_blocking(move || session.read_input())
+        .await
+        .map_err(anyhow::Error::from)??;
     let path = state.config.read().await.settings.input_lua.clone();
-    emit::persist_input(&current, &path)?;
+    emit::persist_input(state.compositor, &current, &path)?;
     Ok(axum::Json(json!({ "path": path })))
 }
 
@@ -439,6 +508,8 @@ async fn sse_events(
 const WEB_KEYS: &[&str] = &[
     "web.title",
     "web.profile_badge",
+    "web.compositor_badge",
+    "web.compositor.no_live",
     "web.connection",
     "web.canvas_label",
     "web.hint",
@@ -468,9 +539,12 @@ const WEB_KEYS: &[&str] = &[
     "web.field.flip",
     "web.field.mirror",
     "web.field.vrr",
+    "web.field.primary",
+    "web.field.primary_help",
     "web.mirror.none",
     "web.screen.disabled",
     "web.screen.flipped",
+    "web.screen.primary",
     "web.prompt.profile_name",
     "web.toast.applied",
     "web.toast.rolled_back",
@@ -600,8 +674,8 @@ fn etag_for(hash: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::hyprland::ipc::fake::FakeSession;
     use crate::config::Config;
-    use crate::ipc::fake::FakeBackend;
     use axum::http::HeaderMap;
 
     const MONITORS: &str = r#"[
@@ -613,7 +687,7 @@ mod tests {
 
     fn state() -> Arc<AppState> {
         AppState::new(
-            Arc::new(FakeBackend::with_monitors(MONITORS)),
+            Arc::new(FakeSession::with_monitors(MONITORS)),
             Config::default(),
         )
     }
@@ -631,6 +705,7 @@ mod tests {
         let outputs = Layout::from_monitors(&state.monitors().await.unwrap()).outputs;
         let req = ApplyRequest {
             outputs,
+            primary: None,
             force: false,
             guard: false,
         };
@@ -640,6 +715,57 @@ mod tests {
             .0;
         assert_eq!(json["specs"].as_array().unwrap().len(), 1);
         assert_eq!(json["rolled_back"], false);
+    }
+
+    #[test]
+    fn a_request_that_says_nothing_about_the_main_screen_is_not_a_request_to_clear_it() {
+        // The distinction the `stated` deserializer exists for: omitting the
+        // field must not wipe a setting the user made from somewhere else.
+        let silent: ApplyRequest = serde_json::from_str(r#"{"outputs":[]}"#).unwrap();
+        assert_eq!(silent.primary, None);
+
+        let cleared: ApplyRequest =
+            serde_json::from_str(r#"{"outputs":[],"primary":null}"#).unwrap();
+        assert_eq!(cleared.primary, Some(None));
+
+        let chosen: ApplyRequest =
+            serde_json::from_str(r#"{"outputs":[],"primary":"DP-1"}"#).unwrap();
+        assert_eq!(chosen.primary, Some(Some("DP-1".to_string())));
+    }
+
+    #[tokio::test]
+    async fn the_main_screen_is_recorded_as_a_fingerprint() {
+        let monitors = AppState::new(
+            Arc::new(FakeSession::with_monitors(MONITORS)),
+            Config::default(),
+        )
+        .monitors()
+        .await
+        .unwrap();
+
+        // The fingerprint, not the connector: the choice has to survive being
+        // plugged into another port, exactly like a profile rule.
+        assert_eq!(
+            primary_setting(Some("eDP-1"), &monitors).as_deref(),
+            Some("AU Optronics 0x5799")
+        );
+        assert_eq!(primary_setting(None, &monitors), None);
+        // A screen we cannot see is kept verbatim rather than dropped: it may be
+        // a pattern the user wrote by hand for hardware that is unplugged.
+        assert_eq!(
+            primary_setting(Some("Dell*"), &monitors).as_deref(),
+            Some("Dell*")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_served_layout_is_anchored_on_the_configured_main_screen() {
+        let mut config = Config::default();
+        config.settings.primary = Some("AU Optronics 0x5799".to_string());
+        let state = AppState::new(Arc::new(FakeSession::with_monitors(MONITORS)), config);
+
+        let json = get_state(State(state)).await.unwrap().0;
+        assert_eq!(json["layout"]["primary"], "eDP-1");
     }
 
     #[tokio::test]
@@ -699,6 +825,21 @@ mod tests {
         );
         assert!(Assets::get("app.js").is_some());
         assert!(Assets::get("style.css").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_script_is_loaded_as_a_module() {
+        // Not a detail of taste: as a classic script every top-level binding of
+        // app.js becomes a page global, and a browser extension that injects one
+        // of its own named `t` takes over the translator. The panel then dies on
+        // its first `t(…)` call and the page loses half its controls with no
+        // clue as to why. A module has no globals to take over.
+        let page = Assets::get("index.html").unwrap();
+        let html = String::from_utf8_lossy(&page.data);
+        assert!(
+            html.contains(r#"<script type="module" src="/app.js">"#),
+            "app.js must be loaded as a module, so it leaks no globals"
+        );
     }
 
     #[tokio::test]

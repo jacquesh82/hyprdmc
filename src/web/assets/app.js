@@ -13,6 +13,7 @@ const panel = el('panel');
 
 let live = null;            // last state received from the daemon
 let draft = [];             // layout currently being edited
+let draftPrimary = null;    // connector the draft calls the main screen
 let selected = null;        // name of the selected connector
 let dirty = false;          // the draft diverges from the live state
 let guardTimer = null;
@@ -25,6 +26,8 @@ let guardTimer = null;
 const I18N_DEFAULTS = {
   'web.title': 'hyprdmc — displays',
   'web.profile_badge': 'profile: %{name}',
+  'web.compositor_badge': '%{name}',
+  'web.compositor.no_live': 'The %{name} plugin only writes configuration files. Arrange your screens here, then use “Make permanent” to write %{file} and reload your compositor.',
   'web.connection': 'connection to the daemon',
   'web.canvas_label': 'Display arrangement',
   'web.hint': "Drag an output to move it — it snaps to neighbouring edges. Arrow keys for fine adjustment.",
@@ -54,9 +57,12 @@ const I18N_DEFAULTS = {
   'web.field.flip': 'Flip the image',
   'web.field.mirror': 'Mirror',
   'web.field.vrr': 'Variable refresh rate (VRR)',
+  'web.field.primary': 'Main screen',
+  'web.field.primary_help': 'The main screen sits at 0×0, opens the row when the displays are arranged automatically, and takes the focus after an apply. Only one at a time.',
   'web.mirror.none': 'none',
   'web.screen.disabled': 'disabled',
   'web.screen.flipped': 'flipped',
+  'web.screen.primary': 'main screen',
   'web.prompt.profile_name': 'Profile name?',
   'web.toast.applied': 'Configuration applied.',
   'web.toast.rolled_back': 'Hyprland did not apply the configuration: previous state restored.',
@@ -111,7 +117,7 @@ const I18N_DEFAULTS = {
   'web.input.scroll_normal': 'Normal',
   'web.input.scroll_inverted': 'Inverted',
   'web.input.scroll_help': 'Inverted is “natural” scrolling: the content follows your fingers.',
-  'web.input.note': 'Applied immediately. “Make permanent” writes input.lua so the settings survive a restart.',
+  'web.input.note': 'Applied immediately. “Make permanent” writes inputs.lua so the settings survive a restart.',
   'web.toast.input_applied': 'Keyboard and pointer settings applied.',
   'web.toast.input_persisted': 'Keyboard and pointer written to %{path}.',
 };
@@ -340,6 +346,21 @@ el('history-scrim').addEventListener('click', () => setHistoryOpen(false));
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const byName = (name) => draft.find((o) => o.name === name);
 
+/** The main screen the daemon currently has on record, or null. */
+const livePrimary = () => live?.layout?.primary ?? null;
+
+/**
+ * The main screen of the draft, but only if it can actually anchor anything.
+ *
+ * Mirrors `Layout::primary_output` server-side: a screen that is off, or
+ * mirroring another one, occupies no space of its own — anchoring on it would
+ * mean anchoring on nothing.
+ */
+function anchorOutput() {
+  const o = byName(draftPrimary);
+  return o && occupies(o) ? o : null;
+}
+
 /** Footprint in the workspace: rotation swaps the axes. */
 function logicalSize(o) {
   if (!o.mode) return [0, 0];
@@ -436,6 +457,7 @@ function render() {
     if (!o.enabled) node.classList.add('disabled');
     if (o.mirror_of) node.classList.add('mirrored');
     if (conflicting(o.name)) node.classList.add('conflict');
+    if (o.name === draftPrimary) node.classList.add('primary');
 
     const w = Math.max(lw * view.scale, 54);
     const h = Math.max(lh * view.scale, 34);
@@ -448,6 +470,21 @@ function render() {
     name.className = 'name';
     name.textContent = o.name;
     node.append(name);
+
+    // A star on the box, so the main screen is visible in the arrangement and
+    // not only in the panel of whichever output happens to be selected. The
+    // glyph is decorative and the words go with it: a bare ★ says nothing to a
+    // screen reader, and nothing here is important enough to say twice.
+    if (o.name === draftPrimary) {
+      const star = document.createElement('span');
+      star.className = 'primary-mark';
+      star.textContent = '★';
+      star.setAttribute('aria-hidden', 'true');
+      const label = document.createElement('span');
+      label.className = 'visually-hidden';
+      label.textContent = t('web.screen.primary');
+      node.append(star, label);
+    }
 
     const detail = document.createElement('div');
     detail.className = 'detail';
@@ -471,10 +508,18 @@ function render() {
 /** How many outputs the draft would actually change. */
 function changedCount() {
   const before = live?.layout?.outputs ?? [];
-  return draft.filter((o) => {
-    const was = before.find((p) => p.name === o.name);
-    return !was || JSON.stringify(was) !== JSON.stringify(o);
-  }).length;
+  const changed = new Set(draft
+    .filter((o) => {
+      const was = before.find((p) => p.name === o.name);
+      return !was || JSON.stringify(was) !== JSON.stringify(o);
+    })
+    .map((o) => o.name));
+
+  // The main screen is a choice about the layout, not a field of an output, so
+  // it has to be counted separately — otherwise picking a new one and nothing
+  // else would badge Apply with "0 changes" while the button sits enabled.
+  if (draftPrimary !== livePrimary()) changed.add(draftPrimary ?? '');
+  return changed.size;
 }
 
 /**
@@ -555,12 +600,16 @@ function snap(o) {
   }
 }
 
-/** Brings the top-left corner of the whole set back to the origin. */
+/**
+ * Brings the set back to the origin — the main screen if there is one, the
+ * top-left corner otherwise. Mirrors `Layout::normalize` server-side.
+ */
 function normalize() {
   const active = draft.filter(occupies);
   if (!active.length) return;
-  const dx = Math.min(...active.map((o) => o.x));
-  const dy = Math.min(...active.map((o) => o.y));
+  const anchor = anchorOutput();
+  const dx = anchor ? anchor.x : Math.min(...active.map((o) => o.x));
+  const dy = anchor ? anchor.y : Math.min(...active.map((o) => o.y));
   if (!dx && !dy) return;
   for (const o of active) { o.x -= dx; o.y -= dy; }
 }
@@ -657,6 +706,22 @@ function renderPanel() {
   panel.append(field(t('web.field.mirror'), mirror));
 
   panel.append(field('', checkbox(t('web.field.vrr'), o.vrr, (v) => { o.vrr = v; touch(); })));
+
+  // Exclusive by construction: checking it here is what unchecks it everywhere
+  // else, since there is only one `draftPrimary`. Unavailable for a screen that
+  // is off or mirroring another one — neither can anchor a layout.
+  const canAnchor = occupies(o);
+  const main = checkbox(t('web.field.primary'), o.name === draftPrimary, (v) => {
+    draftPrimary = v ? o.name : null;
+    // The whole arrangement moves with the anchor, so it is re-normalized now
+    // rather than at apply time: what the canvas shows is what gets sent.
+    normalize();
+    touch();
+  });
+  main.querySelector('input').disabled = !canAnchor;
+  const mainField = field('', main);
+  mainField.append(node('p', t('web.field.primary_help'), 'helper'));
+  panel.append(mainField);
 }
 
 function node(tag, text, className) {
@@ -725,6 +790,17 @@ function localIssues() {
 function renderIssues() {
   const box = el('issues');
   const issues = dirty ? localIssues() : (live?.issues ?? []);
+  // A compositor hyprdmc cannot drive is standing news, not an issue with this
+  // particular layout, so it is stated whether or not anything else is wrong.
+  if (!liveApply()) {
+    issues.unshift({
+      severity: 'warning',
+      message: t('web.compositor.no_live', {
+        name: live.compositor.label,
+        file: live.compositor.monitorsFile,
+      }),
+    });
+  }
   if (!issues.length) {
     box.hidden = true;
     return;
@@ -739,7 +815,7 @@ function renderIssues() {
     list.append(item);
   }
   box.append(list);
-  el('btn-apply').disabled = issues.some((i) => i.severity === 'error');
+  el('btn-apply').disabled = !liveApply() || issues.some((i) => i.severity === 'error');
 }
 
 // --------------------------------------------------------------- network --
@@ -775,6 +851,9 @@ function toast(message, isError = false) {
 function syncDraft(outputs) {
   draft = outputs.map((o) => byName(o.name) ?? clone(o));
   if (!byName(selected)) selected = draft[0]?.name ?? null;
+  // A main screen that has just been unplugged is no longer a choice we can
+  // send; the daemon would answer the same thing anyway.
+  if (draftPrimary && !byName(draftPrimary)) draftPrimary = null;
 }
 
 function adopt(state) {
@@ -784,10 +863,12 @@ function adopt(state) {
   } else {
     // Nothing being edited: the live state wins outright, positions included.
     draft = clone(state.layout.outputs);
+    draftPrimary = livePrimary();
     if (!byName(selected)) selected = draft[0]?.name ?? null;
   }
   el('profile-badge').hidden = !state.activeProfile;
   el('profile-badge').textContent = state.activeProfile ? t('web.profile_badge', { name: state.activeProfile }) : '';
+  renderCompositor(state.compositor);
   showGuard(state.revertPending, state.confirmTimeoutSecs);
   render();
   // `state.history` (pushed over SSE) only carries the raw snapshot fields;
@@ -795,6 +876,25 @@ function adopt(state) {
   // re-fetch it here rather than duplicating the server's age/summary logic.
   refreshHistory();
 }
+
+/**
+ * Names the compositor plugin in force, and says so when it cannot apply.
+ *
+ * A plugin that only writes files must not leave an enabled Apply button that
+ * fails on every click: the button goes away and the note explains what to do
+ * instead. `liveApply` is read from the state rather than assumed, so the day a
+ * transport lands for another compositor the UI needs no change.
+ */
+function renderCompositor(compositor) {
+  const badge = el('compositor-badge');
+  badge.hidden = !compositor;
+  if (!compositor) return;
+  badge.textContent = t('web.compositor_badge', { name: compositor.label });
+  badge.classList.toggle('warn', !compositor.supportsLive);
+}
+
+/** Can the current compositor be reconfigured without a restart? */
+const liveApply = () => live?.compositor?.supportsLive !== false;
 
 /** Seconds left below which the guard switches to its urgent styling. */
 const GUARD_URGENT_AT = 5;
@@ -893,7 +993,7 @@ el('btn-apply').addEventListener('click', async () => {
   try {
     const report = await api('/api/apply', {
       method: 'POST',
-      body: JSON.stringify({ outputs: draft, guard: true }),
+      body: JSON.stringify({ outputs: draft, primary: draftPrimary, guard: true }),
     });
     dirty = false;
     if (report.rolled_back) {
@@ -961,8 +1061,14 @@ el('btn-rescan').addEventListener('click', async () => {
 });
 
 el('btn-auto').addEventListener('click', () => {
+  // The main screen opens the row, like `Layout::auto_arrange` server-side:
+  // "left to right" has to start somewhere, and it should not start beside the
+  // screen the user calls their main one.
+  const anchor = anchorOutput();
+  const active = draft.filter(occupies);
+  const order = anchor ? [anchor, ...active.filter((o) => o !== anchor)] : active;
   let cursor = 0;
-  for (const o of draft.filter(occupies)) {
+  for (const o of order) {
     o.x = cursor;
     o.y = 0;
     cursor += logicalSize(o)[0];
@@ -1206,7 +1312,7 @@ function renderInput() {
     }
   }
 
-  el('btn-input-apply').disabled = !inputDirty();
+  el('btn-input-apply').disabled = !inputDirty() || !liveApply();
   el('btn-input-reset').disabled = !inputDirty();
 }
 

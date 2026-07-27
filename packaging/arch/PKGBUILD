@@ -18,7 +18,10 @@ optdepends=(
   'libnotify: desktop notifications on hotplug'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # replace with `updpkgsums` once the tag exists
+# SKIP until the tag is published: the checksum is of what that URL downloads, so
+# it cannot be computed before the tag exists. `publish-aur.sh` runs `updpkgsums`
+# against the real tarball and prints the value to paste back here.
+sha256sums=('SKIP')
 
 prepare() {
   cd "$pkgname-$pkgver"

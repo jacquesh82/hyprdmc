@@ -13,12 +13,13 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::apply::{self, ApplyReport};
+use crate::compositor::Compositor;
 use crate::config::Config;
 use crate::history::{Snapshot, Store, signature};
-use crate::ipc::{HyprBackend, HyprEvent, HyprSocket};
 use crate::layout::Layout;
 use crate::monitor::Monitor;
 use crate::notify::{self, Urgency};
+use crate::session::{CompositorEvent, Session};
 
 /// A dock fires several events in a row; we wait for things to settle.
 const DEBOUNCE: Duration = Duration::from_millis(500);
@@ -95,7 +96,14 @@ struct PendingRevert {
 
 /// State shared between the daemon, the web API, and one-off commands.
 pub struct AppState {
-    pub backend: Arc<dyn HyprBackend>,
+    pub session: Arc<dyn Session>,
+    /// The compositor plugin in force, resolved once at startup.
+    ///
+    /// Resolved once rather than per call: it is decided by the environment and
+    /// by `config.toml`, neither of which changes under a running session, and a
+    /// layout applied with one plugin then rolled back with another would be a
+    /// bug with no good way to reproduce it.
+    pub compositor: &'static (dyn Compositor + Sync),
     pub config: RwLock<Config>,
     /// Broadcasts the full state to SSE clients.
     pub events: broadcast::Sender<String>,
@@ -105,16 +113,24 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(backend: Arc<dyn HyprBackend>, config: Config) -> Arc<Self> {
-        Self::with_store(backend, config, Store::load())
+    pub fn new(session: Arc<dyn Session>, config: Config) -> Arc<Self> {
+        Self::with_store(session, config, Store::load())
     }
 
     /// Same, with an explicit store — used by tests so they never touch the
     /// user's real state file.
-    pub fn with_store(backend: Arc<dyn HyprBackend>, config: Config, store: Store) -> Arc<Self> {
+    pub fn with_store(session: Arc<dyn Session>, config: Config, store: Store) -> Arc<Self> {
+        // A misconfigured plugin name must not take the daemon down: it is
+        // reported by every command that loads the config, and falling back keeps
+        // the user's displays working meanwhile.
+        let compositor = config.compositor().unwrap_or_else(|err| {
+            tracing::warn!("{err:#}; falling back to the detected compositor");
+            crate::compositor::resolve(None).expect("the fallback never fails")
+        });
         let (events, _) = broadcast::channel(16);
         Arc::new(Self {
-            backend,
+            session,
+            compositor,
             config: RwLock::new(config),
             events,
             store: Mutex::new(store),
@@ -124,8 +140,8 @@ impl AppState {
 
     /// Reads output state without blocking the async executor.
     pub async fn monitors(&self) -> Result<Vec<Monitor>> {
-        let backend = Arc::clone(&self.backend);
-        tokio::task::spawn_blocking(move || backend.monitors()).await?
+        let session = Arc::clone(&self.session);
+        tokio::task::spawn_blocking(move || session.outputs()).await?
     }
 
     /// Applies a layout, then arms the automatic revert if the user has
@@ -142,16 +158,18 @@ impl AppState {
         guard: bool,
         profile: Option<String>,
     ) -> Result<ApplyReport> {
-        let backend = Arc::clone(&self.backend);
+        let session = Arc::clone(&self.session);
+        let compositor = self.compositor;
         let previous = {
-            let b = Arc::clone(&self.backend);
-            tokio::task::spawn_blocking(move || apply::snapshot(b.as_ref())).await??
+            let s = Arc::clone(&self.session);
+            tokio::task::spawn_blocking(move || apply::snapshot(s.as_ref())).await??
         };
 
         let target = layout.clone();
-        let report =
-            tokio::task::spawn_blocking(move || apply::apply(backend.as_ref(), &target, force))
-                .await??;
+        let report = tokio::task::spawn_blocking(move || {
+            apply::apply(session.as_ref(), compositor, &target, force)
+        })
+        .await??;
 
         let timeout = Duration::from_secs(self.config.read().await.settings.confirm_timeout_secs);
         if guard && report.succeeded() && !timeout.is_zero() {
@@ -191,10 +209,13 @@ impl AppState {
         let timer = tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
             tracing::warn!("no confirmation received: reverting to the previous configuration");
-            let backend = Arc::clone(&state.backend);
+            let session = Arc::clone(&state.session);
+            let compositor = state.compositor;
             let layout = to_restore.clone();
-            let _ = tokio::task::spawn_blocking(move || apply::restore(backend.as_ref(), &layout))
-                .await;
+            let _ = tokio::task::spawn_blocking(move || {
+                apply::restore(session.as_ref(), compositor, &layout)
+            })
+            .await;
             state.pending.lock().await.take();
             state.broadcast().await;
         });
@@ -244,9 +265,12 @@ impl AppState {
             return Ok(false);
         };
         p.timer.abort();
-        let backend = Arc::clone(&self.backend);
-        tokio::task::spawn_blocking(move || apply::restore(backend.as_ref(), &p.previous))
-            .await??;
+        let session = Arc::clone(&self.session);
+        let compositor = self.compositor;
+        tokio::task::spawn_blocking(move || {
+            apply::restore(session.as_ref(), compositor, &p.previous)
+        })
+        .await??;
         self.broadcast().await;
         Ok(true)
     }
@@ -283,10 +307,19 @@ impl AppState {
     /// 3. **automatic arrangement** — only when nothing is known and the
     ///    current state is unusable.
     pub async fn choose(&self, monitors: &[Monitor]) -> Result<Origin> {
+        // The main screen is a standing choice, so it is stamped onto whichever
+        // layout wins — including one recalled from the store, which may predate
+        // the choice. Anchoring on it is only done where the layout is being
+        // (re)positioned anyway: `Unchanged` means "these screens are fine where
+        // they are", and moving them to honour an anchor would make a liar of it.
+        let primary = self.config.read().await.primary_output(monitors);
+
         if let Some(profile) = self.config.read().await.best_match(monitors) {
+            let mut layout = profile.resolve(monitors)?.with_primary(primary);
+            layout.normalize();
             return Ok(Origin::Profile {
                 name: profile.name.clone(),
-                layout: profile.resolve(monitors)?,
+                layout,
             });
         }
 
@@ -294,11 +327,11 @@ impl AppState {
             && let Some(snapshot) = self.store.lock().await.recall_for(monitors)
         {
             return Ok(Origin::Recalled {
-                layout: snapshot.layout.clone(),
+                layout: snapshot.layout.clone().with_primary(primary),
             });
         }
 
-        let mut layout = Layout::from_monitors(monitors);
+        let mut layout = Layout::from_monitors(monitors).with_primary(primary);
         if layout.has_errors() {
             layout.auto_arrange();
             return Ok(Origin::Arranged { layout });
@@ -349,8 +382,12 @@ impl AppState {
     /// Full snapshot for the API and the SSE stream.
     pub async fn state_json(&self) -> Result<serde_json::Value> {
         let monitors = self.monitors().await?;
-        let layout = Layout::from_monitors(&monitors);
         let cfg = self.config.read().await;
+        // The live layout carries the main screen the settings designate: the UI
+        // edits a copy of this, so its idea of what is current has to include
+        // the choice, or picking the screen that is already the main one would
+        // read as a pending change.
+        let layout = Layout::from_monitors(&monitors).with_primary(cfg.primary_output(&monitors));
         Ok(serde_json::json!({
             "monitors": monitors,
             "layout": layout,
@@ -359,6 +396,15 @@ impl AppState {
             "activeProfile": cfg.best_match(&monitors).map(|p| p.name.clone()),
             "revertPending": self.pending.lock().await.is_some(),
             "confirmTimeoutSecs": cfg.settings.confirm_timeout_secs,
+            // Enough for the UI to name the plugin, say what it can do, and
+            // point at the file it writes — without a branch on the id.
+            "compositor": {
+                "id": self.compositor.id(),
+                "label": self.compositor.label(),
+                "supportsLive": self.compositor.drives_sessions(),
+                "monitorsFile": self.compositor.monitors_file(),
+                "inputFile": self.compositor.input_file(),
+            },
             "history": self.store.lock().await.history,
         }))
     }
@@ -393,33 +439,45 @@ impl AppState {
     }
 }
 
-/// Main daemon loop.
-///
-/// `socket` is the path to `.socket2.sock`. The function only returns on a
-/// fatal error or a shutdown signal.
-pub async fn run(state: Arc<AppState>, hypr: &HyprSocket) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<HyprEvent>();
-    let socket = hypr.event_socket();
+/// Main daemon loop. Only returns on a fatal error or a shutdown signal.
+pub async fn run(state: Arc<AppState>) -> Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<CompositorEvent>();
 
-    // The event stream lives in its own task and reconnects on its own:
-    // Hyprland can restart without taking the daemon down with it.
-    let listener = tokio::spawn(async move {
-        let mut backoff = RECONNECT_MIN;
-        loop {
-            let tx = tx.clone();
-            match crate::ipc::stream_events(&socket, move |ev| {
-                let _ = tx.send(ev);
-                Ok(())
-            })
-            .await
-            {
-                Ok(()) => tracing::warn!("event stream closed by Hyprland"),
-                Err(err) => tracing::warn!("event stream unavailable: {err:#}"),
+    // The event stream lives in its own task and reconnects on its own: the
+    // compositor can restart without taking the daemon down with it.
+    //
+    // `EventStream::next_event` blocks, so the reading happens on a blocking task
+    // and each event is forwarded into this channel. That is what lets a plugin
+    // implement hotplug with no async code of its own — see [`crate::session`].
+    let listener = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut backoff = RECONNECT_MIN;
+            loop {
+                let tx = tx.clone();
+                let session = Arc::clone(&state.session);
+                let outcome = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut stream = session.watch()?;
+                    while let Some(event) = stream.next_event() {
+                        // The receiver is gone: the daemon is shutting down.
+                        if tx.send(event).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+
+                match outcome {
+                    Ok(Ok(())) => tracing::warn!("event stream closed by the compositor"),
+                    Ok(Err(err)) => tracing::warn!("event stream unavailable: {err:#}"),
+                    Err(err) => tracing::warn!("event reader stopped: {err:#}"),
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX);
             }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(RECONNECT_MAX);
-        }
-    });
+        })
+    };
 
     // Initial alignment on startup: the hardware may have changed while the
     // daemon was not running.
@@ -451,7 +509,7 @@ pub async fn run(state: Arc<AppState>, hypr: &HyprSocket) -> Result<()> {
         tokio::select! {
             event = rx.recv() => match event {
                 Some(ev) => {
-                    if ev.affects_monitors() {
+                    if ev.affects_outputs() {
                         tracing::debug!("output event: {ev:?}");
                         changes.record(&ev);
                         deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
@@ -487,17 +545,22 @@ pub async fn run(state: Arc<AppState>, hypr: &HyprSocket) -> Result<()> {
 }
 
 /// Builds the shared state from the configuration on disk.
-pub fn bootstrap() -> Result<(Arc<AppState>, HyprSocket)> {
-    let hypr = HyprSocket::connect().context(t!("ipc.unreachable").to_string())?;
+///
+/// The plugin decides how to reach the compositor, so this works the same
+/// whichever one is running — and the error, when there is one, names it.
+pub fn bootstrap() -> Result<Arc<AppState>> {
     let config = Config::load()?;
-    let state = AppState::new(Arc::new(hypr.clone()), config);
-    Ok((state, hypr))
+    let compositor = config.compositor()?;
+    let session = compositor
+        .connect()
+        .with_context(|| t!("compositor.unreachable", name = compositor.label()).to_string())?;
+    Ok(AppState::new(Arc::from(session), config))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::fake::FakeBackend;
+    use crate::compositor::hyprland::ipc::fake::FakeSession;
 
     fn json_two_screens() -> String {
         r#"[
@@ -516,7 +579,7 @@ mod tests {
     fn state_with(json: &str, config: Config) -> Arc<AppState> {
         // An ephemeral store: tests must never read or write the real one.
         AppState::with_store(
-            Arc::new(FakeBackend::with_monitors(json)),
+            Arc::new(FakeSession::with_monitors(json)),
             config,
             Store::ephemeral(),
         )
@@ -650,12 +713,12 @@ struct Changes {
 }
 
 impl Changes {
-    fn record(&mut self, event: &HyprEvent) {
+    fn record(&mut self, event: &CompositorEvent) {
         match event {
-            HyprEvent::MonitorAdded(name) if !self.added.contains(name) => {
+            CompositorEvent::OutputAdded(name) if !self.added.contains(name) => {
                 self.added.push(name.clone())
             }
-            HyprEvent::MonitorRemoved(name) if !self.removed.contains(name) => {
+            CompositorEvent::OutputRemoved(name) if !self.removed.contains(name) => {
                 self.removed.push(name.clone())
             }
             _ => {}
@@ -683,8 +746,8 @@ impl Changes {
 #[cfg(test)]
 mod recall_tests {
     use super::*;
+    use crate::compositor::hyprland::ipc::fake::FakeSession;
     use crate::history::Store;
-    use crate::ipc::fake::FakeBackend;
 
     /// Two adjacent screens — a layout that needs no fixing.
     const TWO: &str = r#"[
@@ -697,7 +760,7 @@ mod recall_tests {
     ]"#;
 
     fn state(store: Store, config: Config) -> Arc<AppState> {
-        AppState::with_store(Arc::new(FakeBackend::with_monitors(TWO)), config, store)
+        AppState::with_store(Arc::new(FakeSession::with_monitors(TWO)), config, store)
     }
 
     #[tokio::test]
@@ -751,6 +814,59 @@ mod recall_tests {
             state.choose(&monitors).await.unwrap().profile(),
             Some("desk")
         );
+    }
+
+    #[tokio::test]
+    async fn the_main_screen_is_stamped_on_whatever_layout_wins() {
+        // Including a layout recalled from the store, which was recorded before
+        // the choice existed: the setting is the current truth, the snapshot is
+        // only a memory of where the screens were.
+        let mut cfg = Config::default();
+        cfg.settings.primary = Some("Dell*".into());
+        let state = state(Store::ephemeral(), cfg);
+        let monitors = state.monitors().await.unwrap();
+
+        let stacked = Layout::from_monitors(&monitors);
+        assert_eq!(stacked.primary, None, "the live state knows nothing of it");
+        state
+            .store
+            .lock()
+            .await
+            .record(Snapshot::new(stacked, signature(&monitors), None));
+
+        let origin = state.choose(&monitors).await.unwrap();
+        assert!(matches!(origin, Origin::Recalled { .. }));
+        assert_eq!(origin.layout().primary.as_deref(), Some("DP-1"));
+    }
+
+    #[tokio::test]
+    async fn a_profile_is_anchored_on_the_main_screen() {
+        // The profile puts eDP-1 at 0x0 and the Dell to its right; naming the
+        // Dell as the main screen moves the origin onto it, so the laptop panel
+        // ends up to its left at a negative coordinate.
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[profile]]
+            name = "desk"
+            [[profile.output]]
+            match = "eDP-1"
+            position = "0x0"
+            [[profile.output]]
+            match = "Dell*"
+            position = "1920x0"
+            "#,
+        )
+        .unwrap();
+        cfg.settings.primary = Some("Dell*".into());
+        let state = state(Store::ephemeral(), cfg);
+        let monitors = state.monitors().await.unwrap();
+
+        let origin = state.choose(&monitors).await.unwrap();
+        assert_eq!(origin.profile(), Some("desk"));
+        let layout = origin.layout();
+        assert_eq!(layout.get("DP-1").unwrap().x, 0);
+        assert_eq!(layout.get("eDP-1").unwrap().x, -1920);
+        assert!(!layout.has_errors());
     }
 
     #[tokio::test]

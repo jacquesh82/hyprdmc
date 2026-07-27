@@ -17,9 +17,10 @@ use anyhow::{Result, bail};
 use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::HyprBackend;
+use crate::compositor::Compositor;
 use crate::layout::{Issue, Layout, Severity, format_scale};
 use crate::monitor::Monitor;
+use crate::session::Session;
 
 /// Tolerance on the scale before reporting a drift.
 const SCALE_TOLERANCE: f64 = 0.005;
@@ -88,7 +89,7 @@ impl Drift {
 /// Result of an apply operation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ApplyReport {
-    /// Directives sent to Hyprland.
+    /// Directives sent to the compositor, in its own syntax.
     pub specs: Vec<String>,
     /// Problems detected before sending.
     pub issues: Vec<Issue>,
@@ -244,8 +245,8 @@ pub fn diff(requested: &Layout, actual: &[Monitor]) -> Vec<Drift> {
 }
 
 /// Reads the current state as a layout, so we can go back to it.
-pub fn snapshot(backend: &dyn HyprBackend) -> Result<Layout> {
-    Ok(Layout::from_monitors(&backend.monitors()?))
+pub fn snapshot(session: &dyn Session) -> Result<Layout> {
+    Ok(Layout::from_monitors(&session.outputs()?))
 }
 
 /// Re-reads the state until it matches the request, or until timeout.
@@ -254,10 +255,10 @@ pub fn snapshot(backend: &dyn HyprBackend) -> Result<Layout> {
 /// rotation isn't visible in `j/monitors` until roughly fifty milliseconds
 /// later. We return as soon as no more blocking drift remains, so there's no
 /// needless waiting in the common case.
-pub fn observe(backend: &dyn HyprBackend, layout: &Layout) -> Result<Vec<Drift>> {
+pub fn observe(session: &dyn Session, layout: &Layout) -> Result<Vec<Drift>> {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
-        let drifts = diff(layout, &backend.monitors()?);
+        let drifts = diff(layout, &session.outputs()?);
         let settled = !drifts.iter().any(|d| d.field.converges());
         if settled || Instant::now() >= deadline {
             return Ok(drifts);
@@ -271,7 +272,26 @@ pub fn observe(backend: &dyn HyprBackend, layout: &Layout) -> Result<Vec<Drift>>
 ///
 /// `force` bypasses validation errors *and* observed drifts: it's the escape
 /// hatch for when the user knows what they're doing.
-pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<ApplyReport> {
+pub fn apply(
+    session: &dyn Session,
+    compositor: &dyn Compositor,
+    layout: &Layout,
+    force: bool,
+) -> Result<ApplyReport> {
+    // Refused before anything is read or written: a plugin with no session
+    // implementation has no way to apply, and finding that out after the snapshot
+    // would be the same answer, later.
+    if !compositor.drives_sessions() {
+        bail!(
+            t!(
+                "compositor.no_live_apply",
+                name = compositor.label(),
+                file = compositor.monitors_file()
+            )
+            .to_string()
+        );
+    }
+
     let issues = layout.validate();
     let blocking: Vec<&Issue> = issues
         .iter()
@@ -291,8 +311,8 @@ pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<
         );
     }
 
-    let previous = snapshot(backend)?;
-    let specs = layout.to_lua_calls();
+    let previous = snapshot(session)?;
+    let specs = compositor.output_directives(layout);
 
     let mut report = ApplyReport {
         specs: specs.clone(),
@@ -300,18 +320,31 @@ pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<
         ..Default::default()
     };
 
-    if let Err(err) = backend.set_monitors(&specs) {
+    if let Err(err) = session.apply(&specs) {
         // A batch may have been partially applied: restore the last known-good state.
-        restore(backend, &previous).ok();
+        restore(session, compositor, &previous).ok();
         return Err(err);
     }
 
-    report.drifts = observe(backend, layout)?;
+    report.drifts = observe(session, layout)?;
 
     let fatal = report.drifts.iter().any(|d| d.severity == Severity::Error);
     if fatal && !force {
-        restore(backend, &previous)?;
+        restore(session, compositor, &previous)?;
         report.rolled_back = true;
+    }
+
+    // The main screen takes the focus. Declaring a screen "main" and leaving the
+    // keyboard on another one is not what anyone means by it — and after a
+    // rearrangement the focus can easily have landed elsewhere.
+    //
+    // Best-effort on purpose: a refused dispatch is not worth undoing a layout
+    // that Hyprland just accepted.
+    if !report.rolled_back
+        && let Some(name) = layout.primary_output().map(|o| o.name.clone())
+        && let Err(err) = session.focus(&name)
+    {
+        tracing::debug!("could not focus the main screen {name}: {err:#}");
     }
 
     Ok(report)
@@ -319,8 +352,8 @@ pub fn apply(backend: &dyn HyprBackend, layout: &Layout, force: bool) -> Result<
 
 /// Reapplies a known layout, without validation or verification: we're going
 /// back to a state that worked, and this must not fail.
-pub fn restore(backend: &dyn HyprBackend, layout: &Layout) -> Result<()> {
-    backend.set_monitors(&layout.to_lua_calls())
+pub fn restore(session: &dyn Session, compositor: &dyn Compositor, layout: &Layout) -> Result<()> {
+    session.apply(&compositor.output_directives(layout))
 }
 
 /// Asks the user for confirmation and restores the previous state if there
@@ -330,7 +363,8 @@ pub fn restore(backend: &dyn HyprBackend, layout: &Layout) -> Result<()> {
 /// configuration makes the screen unreadable, doing nothing is enough to
 /// revert.
 pub fn confirm_or_revert(
-    backend: &dyn HyprBackend,
+    session: &dyn Session,
+    compositor: &dyn Compositor,
     previous: &Layout,
     timeout: Duration,
 ) -> Result<bool> {
@@ -374,7 +408,7 @@ pub fn confirm_or_revert(
     };
 
     if !keep {
-        restore(backend, previous)?;
+        restore(session, compositor, previous)?;
     }
     Ok(keep)
 }
@@ -389,7 +423,11 @@ fn stdin_is_tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::fake::FakeBackend;
+    use crate::compositor::hyprland::Hyprland;
+    use crate::compositor::hyprland::ipc::fake::FakeSession;
+
+    /// The plugin under test for everything that is not about plugin choice.
+    const HYPR: Hyprland = Hyprland;
     use crate::layout::OutputState;
     use crate::monitor::{Mode, Rotation, Transform};
 
@@ -507,7 +545,7 @@ mod tests {
     }
 
     /// The `eval` requests sent to the compositor, in order.
-    fn evals(backend: &FakeBackend) -> Vec<String> {
+    fn evals(backend: &FakeSession) -> Vec<String> {
         backend
             .sent_commands()
             .into_iter()
@@ -521,13 +559,13 @@ mod tests {
             ("eDP-1", 1920, 1080, 0, 0, 1.0, 0, false),
             ("DP-1", 1920, 1080, 1920, 0, 1.0, 0, false),
         ]);
-        let backend = FakeBackend::with_monitors(&json);
+        let backend = FakeSession::with_monitors(&json);
         let layout = Layout::new(vec![
             want("eDP-1", 1920, 1080, 0, 0),
             want("DP-1", 1920, 1080, 1920, 0),
         ]);
 
-        let report = apply(&backend, &layout, false).unwrap();
+        let report = apply(&backend, &HYPR, &layout, false).unwrap();
         assert!(report.succeeded());
         assert!(!report.rolled_back);
 
@@ -542,15 +580,38 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_that_drives_no_session_refuses_before_reading_anything() {
+        // A plugin that only renders files has no way to apply. Saying so up
+        // front beats a snapshot, a send that cannot happen, and a rollback of a
+        // change that never took place.
+        let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
+        let backend = FakeSession::with_monitors(&json);
+        let layout = Layout::new(vec![want("DP-1", 1920, 1080, 0, 0)]);
+
+        let err = apply(
+            &backend,
+            &crate::compositor::testing::FileOnly,
+            &layout,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("file only"), "{err}");
+        assert!(
+            backend.sent_commands().is_empty(),
+            "not even a read should have happened"
+        );
+    }
+
+    #[test]
     fn apply_refuses_an_invalid_layout_without_touching_hyprland() {
         let json = monitors_json(&[("A", 1920, 1080, 0, 0, 1.0, 0, false)]);
-        let backend = FakeBackend::with_monitors(&json);
+        let backend = FakeSession::with_monitors(&json);
         // Two overlapping outputs: validation error.
         let layout = Layout::new(vec![
             want("A", 1920, 1080, 0, 0),
             want("B", 1920, 1080, 100, 0),
         ]);
-        let err = apply(&backend, &layout, false).unwrap_err();
+        let err = apply(&backend, &HYPR, &layout, false).unwrap_err();
         assert!(err.to_string().contains("overlap"));
         assert!(
             !backend
@@ -566,10 +627,10 @@ mod tests {
         // The backend always reports 1920x1080 at 0x0: the request for
         // 3000x0 won't be honored, hence rollback.
         let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
-        let backend = FakeBackend::with_monitors(&json);
+        let backend = FakeSession::with_monitors(&json);
         let layout = Layout::new(vec![want("DP-1", 1920, 1080, 3000, 0)]);
 
-        let report = apply(&backend, &layout, false).unwrap();
+        let report = apply(&backend, &HYPR, &layout, false).unwrap();
         assert!(report.rolled_back);
         assert!(!report.succeeded());
 
@@ -588,11 +649,11 @@ mod tests {
         // Reading only once would wrongly conclude failure.
         let rotated = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 1, false)]);
         let not_yet = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
-        let backend = FakeBackend::settling_after(2, &not_yet, &rotated);
+        let backend = FakeSession::settling_after(2, &not_yet, &rotated);
 
         let mut w = want("DP-1", 1920, 1080, 0, 0);
         w.transform = Transform::new(Rotation::R90, false);
-        let report = apply(&backend, &Layout::new(vec![w]), false).unwrap();
+        let report = apply(&backend, &HYPR, &Layout::new(vec![w]), false).unwrap();
 
         assert!(report.succeeded(), "drifts: {:?}", report.drifts);
         assert!(!report.rolled_back);
@@ -613,13 +674,13 @@ mod tests {
            "scale":1.0,"transform":0,"disabled":false,"mirrorOf":"0","availableModes":[]}
         ]"#;
         let not_yet = mirrored.replace(r#""mirrorOf":"0""#, r#""mirrorOf":"none""#);
-        let backend = FakeBackend::settling_after(2, &not_yet, mirrored);
+        let backend = FakeSession::settling_after(2, &not_yet, mirrored);
 
         let mut b = want("DP-1", 1920, 1080, 0, 0);
         b.mirror_of = Some("eDP-1".into());
         let layout = Layout::new(vec![want("eDP-1", 1920, 1080, 0, 0), b]);
 
-        let report = apply(&backend, &layout, false).unwrap();
+        let report = apply(&backend, &HYPR, &layout, false).unwrap();
         assert_eq!(report.drifts, Vec::new(), "mirroring must be awaited");
     }
 
@@ -629,10 +690,10 @@ mod tests {
         let mut w = want("DP-1", 1920, 1080, 0, 0);
         w.scale = 1.37;
         let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.33, 0, false)]);
-        let backend = FakeBackend::with_monitors(&json);
+        let backend = FakeSession::with_monitors(&json);
 
         let started = Instant::now();
-        let report = apply(&backend, &Layout::new(vec![w]), false).unwrap();
+        let report = apply(&backend, &HYPR, &Layout::new(vec![w]), false).unwrap();
         assert!(report.succeeded());
         assert_eq!(report.drifts.len(), 1);
         assert!(
@@ -645,23 +706,83 @@ mod tests {
     fn settling_gives_up_and_reports_a_genuine_failure() {
         // Nothing moves: after the timeout, the drift is properly reported.
         let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
-        let backend = FakeBackend::with_monitors(&json);
+        let backend = FakeSession::with_monitors(&json);
         let mut w = want("DP-1", 1920, 1080, 0, 0);
         w.transform = Transform::new(Rotation::R90, false);
 
-        let report = apply(&backend, &Layout::new(vec![w]), false).unwrap();
+        let report = apply(&backend, &HYPR, &Layout::new(vec![w]), false).unwrap();
         assert!(report.rolled_back);
     }
 
     #[test]
     fn force_keeps_the_result_despite_drift() {
         let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
-        let backend = FakeBackend::with_monitors(&json);
+        let backend = FakeSession::with_monitors(&json);
         let layout = Layout::new(vec![want("DP-1", 1920, 1080, 3000, 0)]);
 
-        let report = apply(&backend, &layout, true).unwrap();
+        let report = apply(&backend, &HYPR, &layout, true).unwrap();
         assert!(!report.rolled_back);
         assert!(!report.drifts.is_empty());
+    }
+
+    #[test]
+    fn apply_moves_the_focus_to_the_main_screen() {
+        let json = monitors_json(&[
+            ("eDP-1", 1920, 1080, 0, 0, 1.0, 0, false),
+            ("DP-1", 1920, 1080, 1920, 0, 1.0, 0, false),
+        ]);
+        let backend = FakeSession::with_monitors(&json);
+        let layout = Layout::new(vec![
+            want("eDP-1", 1920, 1080, 0, 0),
+            want("DP-1", 1920, 1080, 1920, 0),
+        ])
+        .with_primary(Some("DP-1".into()));
+
+        assert!(apply(&backend, &HYPR, &layout, false).unwrap().succeeded());
+        assert!(
+            backend
+                .sent_commands()
+                .iter()
+                .any(|c| c == "dispatch focusmonitor DP-1")
+        );
+    }
+
+    #[test]
+    fn without_a_main_screen_the_focus_is_left_alone() {
+        let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
+        let backend = FakeSession::with_monitors(&json);
+        apply(
+            &backend,
+            &HYPR,
+            &Layout::new(vec![want("DP-1", 1920, 1080, 0, 0)]),
+            false,
+        )
+        .unwrap();
+        assert!(
+            !backend
+                .sent_commands()
+                .iter()
+                .any(|c| c.contains("focusmonitor")),
+            "nothing was designated: the focus is none of our business"
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_layout_does_not_move_the_focus() {
+        // The backend never honours 3000x0, so this apply rolls back; focusing
+        // the main screen of a layout that no longer exists would be wrong.
+        let json = monitors_json(&[("DP-1", 1920, 1080, 0, 0, 1.0, 0, false)]);
+        let backend = FakeSession::with_monitors(&json);
+        let layout =
+            Layout::new(vec![want("DP-1", 1920, 1080, 3000, 0)]).with_primary(Some("DP-1".into()));
+
+        assert!(apply(&backend, &HYPR, &layout, false).unwrap().rolled_back);
+        assert!(
+            !backend
+                .sent_commands()
+                .iter()
+                .any(|c| c.contains("focusmonitor"))
+        );
     }
 
     #[test]
@@ -670,12 +791,12 @@ mod tests {
             ("A", 1920, 1080, 0, 0, 1.0, 0, false),
             ("B", 1920, 1080, 100, 0, 1.0, 0, false),
         ]);
-        let backend = FakeBackend::with_monitors(&json);
+        let backend = FakeSession::with_monitors(&json);
         let layout = Layout::new(vec![
             want("A", 1920, 1080, 0, 0),
             want("B", 1920, 1080, 100, 0),
         ]);
-        let report = apply(&backend, &layout, true).unwrap();
+        let report = apply(&backend, &HYPR, &layout, true).unwrap();
         assert!(!report.rolled_back);
     }
 }

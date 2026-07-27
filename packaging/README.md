@@ -33,6 +33,38 @@ The Arch package is built natively, since Arch is where `makepkg` belongs:
 cd packaging/arch && updpkgsums && makepkg -si
 ```
 
+## Publishing to the AUR
+
+```sh
+./packaging/arch/publish-aur.sh --dry-run   # shows exactly what would be pushed
+./packaging/arch/publish-aur.sh
+```
+
+The script builds the AUR repository in a temporary directory from the `PKGBUILD`
+kept here, so there is no second copy to drift. An AUR repository holds the recipe
+and nothing else — `PKGBUILD` and `.SRCINFO`, never a tarball, never a built
+package. `.SRCINFO` is what the AUR actually reads: it never executes the
+`PKGBUILD`, so a `.SRCINFO` that is missing or stale is a package whose metadata is
+wrong on the site.
+
+Two things the script checks before touching anything, because both are outside
+what it can fix:
+
+1. **The tag must be pushed to GitHub.** `source=` points at
+   `archive/refs/tags/v$pkgver.tar.gz`, and the checksum is computed from what that
+   downloads. Without the tag the AUR would fetch a 404.
+2. **Your AUR SSH key must be registered on your AUR account**
+   (<https://aur.archlinux.org/account> → *SSH Public Key*). Verify with
+   `ssh aur@aur.archlinux.org help`.
+
+The AUR only accepts pushes to `master`, whatever the local default branch is
+called; the script renames accordingly. The repository is created by the first
+push — cloning a package that does not exist yet warns and gives you an empty
+directory, which is expected.
+
+Afterwards, copy the checksum the script prints back into `arch/PKGBUILD`, so the
+committed recipe stops saying `SKIP`.
+
 ## Minimum Rust version, and what it costs Debian
 
 The crate needs **rustc 1.88**: two `let` chains in `src/daemon.rs` and

@@ -1,11 +1,13 @@
-//! Persistence: generating `monitors.lua` and wiring that file into the
-//! user's Hyprland configuration.
+//! Persistence: generating the configuration files and wiring them into the
+//! user's own configuration.
 //!
-//! Guiding principle: `hyprdmc` is the sole owner of `monitors.lua` and
-//! only touches `hyprland.lua` once, to add a `require` line to it.
+//! Guiding principle: `hyprdmc` is the sole owner of the files it generates and
+//! only touches the user's main configuration once, to add an include line.
 //!
-//! Since Hyprland 0.55 the configuration is Lua; hyprlang — and with it
-//! `monitor = …` directives and `source = …` — is gone.
+//! Nothing here knows a compositor's syntax. The directives, the comment marker,
+//! the include statement and the shape of a directive worth adopting all come
+//! from a [`Compositor`] plugin, which is what lets the same `init` and the same
+//! `persist` serve Hyprland, sway, or whatever gets added next.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,11 +16,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use rust_i18n::t;
 
+use crate::compositor::Compositor;
 use crate::config::home;
-use crate::layout::{Layout, lua_string};
+use crate::input::InputConfig;
+use crate::layout::Layout;
 
 /// Writes a file atomically: a sibling temporary file, then `rename`, so
-/// that no reader ever sees partial content — Hyprland could reload the
+/// that no reader ever sees partial content — the compositor could reload the
 /// configuration mid-write.
 pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -50,38 +54,61 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
     })
 }
 
-/// Renders the contents of `monitors.lua` for a layout.
-pub fn render(layout: &Layout) -> String {
-    let mut out = t!("emit.header").to_string();
-    out.push('\n');
-    for call in layout.to_lua_calls() {
-        out.push_str(&call);
+/// Prefixes every line of `text` with the compositor's comment marker.
+///
+/// The headers in `locales/app.yml` are plain sentences with no marker of their
+/// own: one translated block serves every plugin, and the syntax is added here.
+fn commented(c: &dyn Compositor, text: &str) -> String {
+    text.lines()
+        .map(|line| format!("{} {line}\n", c.comment()))
+        .collect()
+}
+
+/// Renders the generated monitor configuration for a layout.
+///
+/// The main screen appears as a comment rather than as a directive: no
+/// compositor here has a "primary output" keyword, and what makes a screen the
+/// main one — being the output at (0, 0) — is already baked into the positions
+/// below. The comment is there so someone reading the file can tell that the
+/// origin was chosen rather than fallen into.
+pub fn render(c: &dyn Compositor, layout: &Layout) -> String {
+    let mut out = commented(c, &t!("emit.header"));
+    if let Some(primary) = layout.primary_output() {
+        out.push_str(&format!(
+            "{} {}\n",
+            c.comment(),
+            t!("emit.primary_comment", name = &primary.name)
+        ));
+    }
+    for directive in c.output_directives(layout) {
+        out.push_str(&directive);
         out.push('\n');
     }
     out
 }
 
-/// Writes the layout to `monitors.lua`.
-pub fn persist(layout: &Layout, path: &Path) -> Result<()> {
-    write_atomic(path, &render(layout))
+/// Writes the layout to the generated monitor file.
+pub fn persist(c: &dyn Compositor, layout: &Layout, path: &Path) -> Result<()> {
+    write_atomic(path, &render(c, layout))
 }
 
-/// Renders the contents of `input.lua`.
-pub fn render_input(input: &crate::input::InputConfig) -> String {
-    let mut out = t!("emit.input_header").to_string();
-    out.push('\n');
-    out.push_str(&input.to_lua());
-    out.push('\n');
+/// Renders the generated keyboard and pointer configuration.
+pub fn render_input(c: &dyn Compositor, input: &InputConfig) -> String {
+    let mut out = commented(c, &t!("emit.input_header"));
+    for directive in c.input_directives(input) {
+        out.push_str(&directive);
+        out.push('\n');
+    }
     out
 }
 
-/// Writes the keyboard and pointer settings to `input.lua`.
-pub fn persist_input(input: &crate::input::InputConfig, path: &Path) -> Result<()> {
-    write_atomic(path, &render_input(input))
+/// Writes the keyboard and pointer settings to the generated input file.
+pub fn persist_input(c: &dyn Compositor, input: &InputConfig, path: &Path) -> Result<()> {
+    write_atomic(path, &render_input(c, input))
 }
 
 /// Replaces the home directory prefix with `~`, the way one would write it
-/// by hand in `hyprland.lua`.
+/// by hand in a configuration file.
 pub fn tildify(path: &Path) -> String {
     let home = home();
     match path.strip_prefix(&home) {
@@ -93,56 +120,33 @@ pub fn tildify(path: &Path) -> String {
 /// What `hyprdmc init` did (or would do, in a dry run).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InitReport {
-    /// `hyprland.lua` was already pulling in the generated file.
+    /// The main configuration was already pulling in the generated file.
     pub already_wired: bool,
     /// Backup copy created.
     pub backup: Option<PathBuf>,
-    /// `hl.monitor{…}` calls lifted from `hyprland.lua` and then commented
+    /// Output directives lifted from the main configuration and then commented
     /// out, each flattened onto a single line.
     pub adopted: Vec<String>,
-    /// New contents of `hyprland.lua`.
+    /// New contents of the main configuration.
     pub new_conf: String,
 }
 
-/// The Lua statement that pulls the generated file into `hyprland.lua`.
-///
-/// Hyprland's `package.path` only covers its own configuration directory,
-/// so `require` is available exactly when both files are neighbours; a
-/// generated file placed anywhere else is loaded by absolute path.
-pub fn require_statement(hyprland_lua: &Path, monitors_lua: &Path) -> String {
-    let module = monitors_lua.file_stem().and_then(|s| s.to_str());
-    match (module, monitors_lua.parent(), hyprland_lua.parent()) {
-        (Some(m), Some(dir), Some(conf_dir)) if dir == conf_dir => {
-            format!("require({})", lua_string(m))
-        }
-        _ => format!(
-            "dofile({})",
-            lua_string(&monitors_lua.display().to_string())
-        ),
-    }
-}
-
-/// Computes the transformation to apply to `hyprland.lua`.
+/// Computes the transformation to apply to the user's main configuration.
 ///
 /// Kept separate from the write so the result can be shown to the user
 /// before touching their file.
-pub fn plan_init(conf: &str, hyprland_lua: &Path, monitors_lua: &Path) -> InitReport {
-    let statement = require_statement(hyprland_lua, monitors_lua);
-    let target = monitors_lua
+pub fn plan_init(c: &dyn Compositor, conf: &str, main: &Path, generated: &Path) -> InitReport {
+    let statement = c.include(main, generated);
+    let target = generated
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("monitors.lua");
-    let module = monitors_lua
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("monitors");
+        .unwrap_or("the generated file");
 
-    let already = conf.lines().any(|l| {
-        let l = l.trim();
-        !l.starts_with("--")
-            && (l.contains("require(") || l.contains("dofile("))
-            && (l.contains(module) || l.contains(target))
-    });
+    let is_comment = |line: &str| line.trim_start().starts_with(c.comment());
+
+    let already = conf
+        .lines()
+        .any(|l| !is_comment(l) && c.includes(l, generated));
     if already {
         return InitReport {
             already_wired: true,
@@ -153,26 +157,32 @@ pub fn plan_init(conf: &str, hyprland_lua: &Path, monitors_lua: &Path) -> InitRe
 
     let mut adopted = Vec::new();
     let mut lines: Vec<String> = Vec::new();
-    // A `hl.monitor{…}` call routinely spans several lines: it is commented
-    // out as a block, tracked by counting the delimiters it leaves open.
+    // A directive may span several lines — a `hl.monitor{…}` call routinely
+    // does — so it is commented out as a block, tracked by counting the
+    // delimiters it leaves open. A syntax whose directives are always one line
+    // simply closes at depth 0 on the first line and never enters the block.
     let mut block: Vec<String> = Vec::new();
     let mut depth = 0i32;
     let mut after_adopted = None;
-    let mut after_require = None;
+    let mut after_include = None;
 
     for line in conf.lines() {
         let trimmed = line.trim();
-        let opening = depth == 0 && !trimmed.starts_with("--") && trimmed.contains("hl.monitor(");
+        let opening = depth == 0 && !is_comment(line) && c.opens_output(line);
 
         if opening || depth > 0 {
             if opening {
-                lines.push(t!("emit.adopted_comment", target = target).to_string());
-                depth = delimiter_delta(line);
+                lines.push(format!(
+                    "{} {}",
+                    c.comment(),
+                    t!("emit.adopted_comment", target = target)
+                ));
+                depth = delimiter_delta(line, c.comment());
             } else {
-                depth += delimiter_delta(line);
+                depth += delimiter_delta(line, c.comment());
             }
             block.push(trimmed.to_string());
-            lines.push(format!("-- {line}"));
+            lines.push(format!("{} {line}", c.comment()));
             if depth <= 0 {
                 depth = 0;
                 adopted.push(block.join(" "));
@@ -183,23 +193,21 @@ pub fn plan_init(conf: &str, hyprland_lua: &Path, monitors_lua: &Path) -> InitRe
         }
 
         lines.push(line.to_string());
-        if !trimmed.starts_with("--")
-            && (trimmed.contains("require(") || trimmed.contains("dofile("))
-        {
-            after_require = Some(lines.len());
+        if !is_comment(line) && c.is_include(line) {
+            after_include = Some(lines.len());
         }
     }
 
-    // An unterminated call means the file was already broken; everything
+    // An unterminated directive means the file was already broken; everything
     // read so far is commented out, so nothing is lost.
     if !block.is_empty() {
         adopted.push(block.join(" "));
     }
 
-    // The statement takes the place of the monitor configuration it
-    // replaces; failing that, it joins the other `require`s, and failing
-    // that it opens the file.
-    let insert_at = after_adopted.or(after_require).unwrap_or(0);
+    // The statement takes the place of the monitor configuration it replaces;
+    // failing that, it joins the other includes, and failing that it opens the
+    // file.
+    let insert_at = after_adopted.or(after_include).unwrap_or(0);
     lines.insert(insert_at, statement);
 
     let mut new_conf = lines.join("\n");
@@ -216,46 +224,55 @@ pub fn plan_init(conf: &str, hyprland_lua: &Path, monitors_lua: &Path) -> InitRe
 }
 
 /// How many delimiters the line leaves open, trailing comment excluded.
-fn delimiter_delta(line: &str) -> i32 {
-    let code = line.split("--").next().unwrap_or("");
-    code.chars().fold(0, |acc, c| match c {
+fn delimiter_delta(line: &str, comment: &str) -> i32 {
+    let code = line.split(comment).next().unwrap_or("");
+    code.chars().fold(0, |acc, ch| match ch {
         '(' | '{' => acc + 1,
         ')' | '}' => acc - 1,
         _ => acc,
     })
 }
 
-/// Wires `monitors.lua` into `hyprland.lua`, with a prior backup.
-pub fn run_init(hyprland_lua: &Path, monitors_lua: &Path, dry_run: bool) -> Result<InitReport> {
-    run_init_all(hyprland_lua, &[monitors_lua], dry_run)
+/// Wires one generated file into the main configuration, with a prior backup.
+pub fn run_init(
+    c: &dyn Compositor,
+    main: &Path,
+    generated: &Path,
+    dry_run: bool,
+) -> Result<InitReport> {
+    run_init_all(c, main, &[generated], dry_run)
 }
 
 /// Wires several generated files in one pass: one read, one backup, one write.
 ///
-/// Doing them one at a time would back up `hyprland.lua` once per file, and
-/// the second backup would be of the already-modified version — losing the
+/// Doing them one at a time would back up the main configuration once per file,
+/// and the second backup would be of the already-modified version — losing the
 /// only copy of what the user actually wrote.
 ///
 /// `already_wired` in the report means *everything* was already wired: one
-/// file still missing its `require` is enough to make the pass worth running.
+/// file still missing its include is enough to make the pass worth running.
 ///
-/// Order matters: `monitors.lua` must come first, since that pass is also the
-/// one that adopts the `hl.monitor{…}` calls already in the file, and the
-/// comment it leaves behind names the file they moved to.
-pub fn run_init_all(hyprland_lua: &Path, generated: &[&Path], dry_run: bool) -> Result<InitReport> {
-    let conf = std::fs::read_to_string(hyprland_lua).with_context(|| {
-        t!("fs.read_failed", path = hyprland_lua.display().to_string()).to_string()
-    })?;
+/// Order matters: the monitor file must come first, since that pass is also the
+/// one that adopts the output directives already in the file, and the comment it
+/// leaves behind names the file they moved to.
+pub fn run_init_all(
+    c: &dyn Compositor,
+    main: &Path,
+    generated: &[&Path],
+    dry_run: bool,
+) -> Result<InitReport> {
+    let conf = std::fs::read_to_string(main)
+        .with_context(|| t!("fs.read_failed", path = main.display().to_string()).to_string())?;
 
     // Each pass plans against the output of the previous one, so the second
-    // `require` lands next to the first rather than at the top of the file.
+    // include lands next to the first rather than at the top of the file.
     let mut report = InitReport {
         already_wired: true,
         new_conf: conf,
         ..Default::default()
     };
     for target in generated {
-        let step = plan_init(&report.new_conf, hyprland_lua, target);
+        let step = plan_init(c, &report.new_conf, main, target);
         report.already_wired &= step.already_wired;
         report.adopted.extend(step.adopted);
         report.new_conf = step.new_conf;
@@ -268,20 +285,22 @@ pub fn run_init_all(hyprland_lua: &Path, generated: &[&Path], dry_run: bool) -> 
     // Appended rather than substituted: `with_extension` would turn
     // `hyprland.lua` into `hyprland.hyprdmc.bak` and lose which file it
     // came from.
-    let mut name = hyprland_lua.file_name().unwrap_or_default().to_os_string();
+    let mut name = main.file_name().unwrap_or_default().to_os_string();
     name.push(".hyprdmc.bak");
-    let backup = hyprland_lua.with_file_name(name);
-    std::fs::copy(hyprland_lua, &backup)
+    let backup = main.with_file_name(name);
+    std::fs::copy(main, &backup)
         .with_context(|| t!("fs.backup_failed", path = backup.display().to_string()).to_string())?;
     report.backup = Some(backup);
 
-    write_atomic(hyprland_lua, &report.new_conf)?;
+    write_atomic(main, &report.new_conf)?;
     Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::hyprland::Hyprland;
+    use crate::compositor::sway::Sway;
     use crate::layout::OutputState;
     use crate::monitor::{Mode, Rotation, Transform};
 
@@ -303,15 +322,20 @@ mod tests {
     const MONITORS_LUA: &str = "/home/u/.config/hypr/monitors.lua";
 
     fn plan(conf: &str) -> InitReport {
-        plan_init(conf, Path::new(HYPRLAND_LUA), Path::new(MONITORS_LUA))
+        plan_init(
+            &Hyprland,
+            conf,
+            Path::new(HYPRLAND_LUA),
+            Path::new(MONITORS_LUA),
+        )
     }
 
     #[test]
-    fn render_emits_one_call_per_output() {
+    fn render_emits_one_directive_per_output() {
         let mut b = out("DP-1", 1920, 0);
         b.transform = Transform::new(Rotation::R90, false);
         let layout = Layout::new(vec![out("eDP-1", 0, 0), b]);
-        let text = render(&layout);
+        let text = render(&Hyprland, &layout);
         assert!(text.starts_with("-- Generated by hyprdmc"));
         assert!(text.contains("output = \"eDP-1\""));
         assert!(text.contains("position = \"1920x0\", scale = 1, transform = 1"));
@@ -324,45 +348,83 @@ mod tests {
     }
 
     #[test]
+    fn the_same_layout_renders_for_another_compositor() {
+        // The point of the seam: one layout, two syntaxes, no branch in here.
+        let layout = Layout::new(vec![out("eDP-1", 0, 0), out("DP-1", 1920, 0)]);
+        let text = render(&Sway, &layout);
+        assert!(
+            text.starts_with("# Generated by hyprdmc"),
+            "the header takes the compositor's comment marker: {text}"
+        );
+        assert!(text.contains(r#"output "eDP-1" enable mode 1920x1080@60.000Hz position 0 0"#));
+        assert_eq!(text.lines().filter(|l| l.starts_with("output ")).count(), 2);
+        assert!(
+            !text.contains("hl.monitor"),
+            "no Lua leaked into a sway file"
+        );
+    }
+
+    #[test]
+    fn the_main_screen_is_recorded_as_a_comment_in_either_syntax() {
+        let layout = Layout::new(vec![out("eDP-1", 0, 0), out("DP-1", 1920, 0)])
+            .with_primary(Some("DP-1".into()));
+        assert!(render(&Hyprland, &layout).contains("-- main screen: DP-1"));
+        assert!(render(&Sway, &layout).contains("# main screen: DP-1"));
+
+        let plain = render(&Hyprland, &Layout::new(vec![out("eDP-1", 0, 0)]));
+        assert!(!plain.contains("main screen"));
+    }
+
+    #[test]
     fn the_input_file_carries_only_input_settings() {
-        let text = render_input(&crate::input::InputConfig {
+        let input = InputConfig {
             kb_layout: "fr".into(),
             kb_variant: "oss".into(),
             kb_options: String::new(),
             natural_scroll: false,
             touchpad_natural_scroll: true,
-        });
+        };
+        let text = render_input(&Hyprland, &input);
         assert!(text.starts_with("-- Generated by hyprdmc"));
         assert!(text.contains(r#"kb_layout = "fr""#));
         assert!(
             !text.contains("hl.monitor("),
-            "a screen has no business in input.lua"
+            "a screen has no business in the input file"
         );
+
+        let sway = render_input(&Sway, &input);
+        assert!(sway.starts_with("# Generated by hyprdmc"));
+        assert!(sway.contains("input type:keyboard {"));
+        assert!(sway.contains(r#"xkb_layout "fr""#));
     }
 
     #[test]
-    fn wiring_several_files_adds_one_require_each() {
-        const INPUT_LUA: &str = "/home/u/.config/hypr/input.lua";
+    fn wiring_several_files_adds_one_include_each() {
+        const INPUT_LUA: &str = "/home/u/.config/hypr/inputs.lua";
         let mut report = InitReport {
             already_wired: true,
             new_conf: "-- my config\n".to_string(),
             ..Default::default()
         };
         for target in [MONITORS_LUA, INPUT_LUA] {
-            let step = plan_init(&report.new_conf, Path::new(HYPRLAND_LUA), Path::new(target));
+            let step = plan_init(
+                &Hyprland,
+                &report.new_conf,
+                Path::new(HYPRLAND_LUA),
+                Path::new(target),
+            );
             report.already_wired &= step.already_wired;
             report.new_conf = step.new_conf;
         }
 
         assert!(!report.already_wired);
         assert!(report.new_conf.contains(r#"require("monitors")"#));
-        assert!(report.new_conf.contains(r#"require("input")"#));
+        assert!(report.new_conf.contains(r#"require("inputs")"#));
     }
 
     #[test]
     fn a_file_already_wired_is_not_wired_twice() {
-        let conf = "require(\"monitors\")\n".to_string();
-        let step = plan_init(&conf, Path::new(HYPRLAND_LUA), Path::new(MONITORS_LUA));
+        let step = plan("require(\"monitors\")\n");
         assert!(step.already_wired);
         assert_eq!(step.new_conf.matches(r#"require("monitors")"#).count(), 1);
     }
@@ -371,15 +433,19 @@ mod tests {
     fn render_disables_switched_off_screens() {
         let mut a = out("eDP-1", 0, 0);
         a.enabled = false;
-        let text = render(&Layout::new(vec![a, out("DP-1", 0, 0)]));
-        assert!(text.contains("hl.monitor({ output = \"eDP-1\", disabled = true })\n"));
+        let layout = Layout::new(vec![a, out("DP-1", 0, 0)]);
+        assert!(
+            render(&Hyprland, &layout)
+                .contains("hl.monitor({ output = \"eDP-1\", disabled = true })\n")
+        );
+        assert!(render(&Sway, &layout).contains("output \"eDP-1\" disable\n"));
     }
 
     #[test]
-    fn generated_file_is_valid_lua_for_a_layout_with_quotes_in_it() {
+    fn generated_file_is_valid_for_a_layout_with_quotes_in_it() {
         let mut a = out("desc:Acme \"27\"", 0, 0);
         a.mirror_of = Some("eDP-1".into());
-        let text = render(&Layout::new(vec![a]));
+        let text = render(&Hyprland, &Layout::new(vec![a]));
         assert!(text.contains(r#"output = "desc:Acme \"27\"""#));
     }
 
@@ -439,6 +505,47 @@ hl.config({ general = { gaps_in = 5 } })
     }
 
     #[test]
+    fn init_adopts_a_one_line_syntax_without_delimiters_too() {
+        // sway's directives never open a brace, so the block tracker has to
+        // close them on their own line rather than swallowing the rest of the
+        // file. This is the case a Lua-shaped `plan_init` would have got wrong.
+        let conf = "# my config\ninclude colors\noutput DP-1 mode 1920x1080 position 0 0\nbindsym Mod4+Return exec foot\n";
+        let generated = Path::new("/home/u/.config/sway/monitors.conf");
+        let report = plan_init(
+            &Sway,
+            conf,
+            Path::new("/home/u/.config/sway/config"),
+            generated,
+        );
+
+        assert_eq!(
+            report.adopted,
+            vec!["output DP-1 mode 1920x1080 position 0 0"]
+        );
+        assert!(
+            report.new_conf.contains("# output DP-1 mode"),
+            "the directive is commented out: {}",
+            report.new_conf
+        );
+        assert!(
+            report.new_conf.contains("bindsym Mod4+Return exec foot"),
+            "everything after it must survive untouched: {}",
+            report.new_conf
+        );
+        // The include the plugin wrote is one the plugin recognises again, which
+        // is what makes `init` idempotent whatever the syntax.
+        let added = report
+            .new_conf
+            .lines()
+            .find(|l| Sway.includes(l, generated))
+            .unwrap_or_else(|| panic!("no include was added: {}", report.new_conf));
+        assert!(added.starts_with("include "), "{added}");
+        assert!(
+            plan_init(&Sway, &report.new_conf, Path::new("/x/config"), generated).already_wired
+        );
+    }
+
+    #[test]
     fn init_is_idempotent() {
         let first = plan(SAMPLE);
         let second = plan(&first.new_conf);
@@ -461,10 +568,10 @@ hl.config({ general = { gaps_in = 5 } })
     }
 
     #[test]
-    fn init_falls_back_to_the_last_require_then_to_the_top() {
-        let after_require = plan("require(\"colors\")\nhl.config({})\n");
+    fn init_falls_back_to_the_last_include_then_to_the_top() {
+        let after_include = plan("require(\"colors\")\nhl.config({})\n");
         assert_eq!(
-            after_require.new_conf.lines().nth(1).unwrap(),
+            after_include.new_conf.lines().nth(1).unwrap(),
             r#"require("monitors")"#
         );
 
@@ -473,9 +580,9 @@ hl.config({ general = { gaps_in = 5 } })
     }
 
     #[test]
-    fn a_generated_file_outside_the_hypr_directory_is_loaded_by_path() {
+    fn a_generated_file_outside_the_config_directory_is_loaded_by_path() {
         assert_eq!(
-            require_statement(
+            Hyprland.include(
                 Path::new(HYPRLAND_LUA),
                 Path::new("/srv/shared/screens.lua")
             ),
@@ -485,9 +592,11 @@ hl.config({ general = { gaps_in = 5 } })
 
     #[test]
     fn delimiter_counting_ignores_trailing_comments() {
-        assert_eq!(delimiter_delta("hl.monitor({"), 2);
-        assert_eq!(delimiter_delta("}) -- (see above)"), -2);
-        assert_eq!(delimiter_delta("hl.monitor({ output = \"X\" })"), 0);
+        assert_eq!(delimiter_delta("hl.monitor({", "--"), 2);
+        assert_eq!(delimiter_delta("}) -- (see above)", "--"), -2);
+        assert_eq!(delimiter_delta("hl.monitor({ output = \"X\" })", "--"), 0);
+        // A `#` comment must not be cut at a Lua marker, and vice versa.
+        assert_eq!(delimiter_delta("output DP-1 # (note)", "#"), 0);
     }
 
     #[test]

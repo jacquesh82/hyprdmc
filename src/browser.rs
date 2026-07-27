@@ -123,10 +123,10 @@ mod tests {
 
     #[test]
     fn wildcard_bind_sends_the_browser_to_loopback() {
-        let any: SocketAddr = "0.0.0.0:8787".parse().unwrap();
-        assert_eq!(reachable_url(any), "http://127.0.0.1:8787");
-        let any6: SocketAddr = "[::]:8787".parse().unwrap();
-        assert_eq!(reachable_url(any6), "http://127.0.0.1:8787");
+        let any: SocketAddr = "0.0.0.0:28787".parse().unwrap();
+        assert_eq!(reachable_url(any), "http://127.0.0.1:28787");
+        let any6: SocketAddr = "[::]:28787".parse().unwrap();
+        assert_eq!(reachable_url(any6), "http://127.0.0.1:28787");
     }
 
     #[test]

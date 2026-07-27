@@ -355,6 +355,19 @@ main {
 }
 .screen.dragging { cursor: grabbing; z-index: 10; transform: none; box-shadow: 0 10px 24px var(--shadow-strong); }
 
+/* The main screen keeps whatever colour its other states give it — being the
+   main one is orthogonal to being selected, mirrored or in conflict — so it is
+   marked by weight and by the star in the corner, not by another hue. */
+.screen.primary { border-width: 3px; }
+.screen .primary-mark {
+  position: absolute;
+  top: .15rem;
+  right: .25rem;
+  font-size: .7rem;
+  line-height: 1;
+  color: var(--accent);
+}
+
 .screen .name { font-weight: 600; font-size: .85rem; }
 .screen .detail { font-size: .72rem; color: var(--muted); }
 
@@ -861,4 +874,11 @@ footer {
   text-align: center;
   color: var(--muted);
   font-size: .9rem;
+}
+
+/* A badge that carries a caveat rather than a fact: the compositor plugin in
+   force when hyprdmc cannot reconfigure it live. */
+.badge.warn {
+  background: color-mix(in srgb, var(--warn) 20%, var(--surface-2));
+  color: var(--text);
 }

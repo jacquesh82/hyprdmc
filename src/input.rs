@@ -3,19 +3,19 @@
 //! Deliberately kept out of the screen profiles: which layout you type in and
 //! which way your touchpad scrolls have nothing to do with which monitors are
 //! plugged in. Docking a laptop must not silently switch the keyboard, so this
-//! lives in its own section of `config.toml` and its own generated file
-//! (`input.lua`), wired into `hyprland.lua` alongside `monitors.lua`.
+//! lives in its own section of `config.toml` and its own generated file, wired
+//! into the compositor's configuration alongside the monitor one.
 //!
-//! Everything goes through `hl.config{…}`: since Hyprland 0.55 the
-//! configuration is Lua and `keyword` is refused outright, exactly as for
-//! monitors (see [`crate::ipc::HyprBackend::set_monitors`]).
+//! Neither writing nor reading these settings is this module's business: the
+//! syntax belongs to whichever compositor is in play
+//! ([`crate::compositor::Compositor::input_directives`]) and so does reading them
+//! back ([`crate::session::Session::read_input`]). What is here is the model, its
+//! validation, and the xkb catalogue the UI needs to offer a choice at all —
+//! none of which is compositor-specific.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rust_i18n::t;
 use serde::{Deserialize, Serialize};
-
-use crate::ipc::HyprBackend;
-use crate::layout::lua_string;
 
 /// Where the xkb catalogue lives on a standard system. `base.lst` ships with
 /// `xkeyboard-config`; if it is missing we fall back to a short built-in list
@@ -62,43 +62,6 @@ impl Default for InputConfig {
 }
 
 impl InputConfig {
-    /// Reads what the compositor is currently using.
-    ///
-    /// The live state is the source of truth: the user may well have set
-    /// `kb_layout` by hand in `hyprland.lua` long before hyprdmc existed, and
-    /// the UI must show that rather than a default we invented.
-    pub fn read(backend: &dyn HyprBackend) -> Result<Self> {
-        Ok(Self {
-            kb_layout: get_string(backend, "input:kb_layout")?,
-            kb_variant: get_string(backend, "input:kb_variant")?,
-            kb_options: get_string(backend, "input:kb_options")?,
-            natural_scroll: get_bool(backend, "input:natural_scroll")?,
-            touchpad_natural_scroll: get_bool(backend, "input:touchpad:natural_scroll")?,
-        })
-    }
-
-    /// The single `hl.config{…}` call that carries every setting.
-    ///
-    /// One call rather than one per field: the compositor reconfigures the
-    /// devices once, and a half-applied keyboard is not a state anyone wants
-    /// to debug.
-    pub fn to_lua(&self) -> String {
-        format!(
-            "hl.config({{ input = {{ kb_layout = {}, kb_variant = {}, kb_options = {}, \
-             natural_scroll = {}, touchpad = {{ natural_scroll = {} }} }} }})",
-            lua_string(&self.kb_layout),
-            lua_string(&self.kb_variant),
-            lua_string(&self.kb_options),
-            self.natural_scroll,
-            self.touchpad_natural_scroll,
-        )
-    }
-
-    /// Applies the settings to the running compositor.
-    pub fn apply(&self, backend: &dyn HyprBackend) -> Result<()> {
-        backend.eval(&self.to_lua())
-    }
-
     /// Rejects what Hyprland would only complain about later.
     ///
     /// Only the layout is required: an empty variant or options string is the
@@ -109,38 +72,6 @@ impl InputConfig {
         }
         Ok(())
     }
-}
-
-/// Reads a string option through `getoption`.
-fn get_string(backend: &dyn HyprBackend, option: &str) -> Result<String> {
-    let value = get_option(backend, option)?;
-    Ok(value
-        .get("str")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        // Hyprland reports an unset string option as the literal
-        // `[[EMPTY]]`, which is not something to show in a text field.
-        .replace("[[EMPTY]]", "")
-        .to_string())
-}
-
-/// Reads a boolean option through `getoption`.
-///
-/// Hyprland answers with `bool` for these, but older versions used `int`;
-/// both are accepted so a version bump does not silently read as `false`.
-fn get_bool(backend: &dyn HyprBackend, option: &str) -> Result<bool> {
-    let value = get_option(backend, option)?;
-    Ok(value
-        .get("bool")
-        .and_then(serde_json::Value::as_bool)
-        .or_else(|| value.get("int").and_then(|v| v.as_i64()).map(|i| i != 0))
-        .unwrap_or(false))
-}
-
-fn get_option(backend: &dyn HyprBackend, option: &str) -> Result<serde_json::Value> {
-    let raw = backend.query(&format!("j/getoption {option}"))?;
-    serde_json::from_str(&raw)
-        .with_context(|| t!("input.unreadable_option", option = option).to_string())
 }
 
 /// One selectable entry of the xkb catalogue: the code Hyprland wants, and
@@ -261,7 +192,6 @@ fn fallback_catalog() -> Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::fake::FakeBackend;
 
     const RULES: &str = "\
 ! model
@@ -314,23 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_travel_as_a_single_nested_config_call() {
-        let cfg = InputConfig {
-            kb_layout: "fr".into(),
-            kb_variant: "oss".into(),
-            kb_options: "compose:ralt".into(),
-            natural_scroll: false,
-            touchpad_natural_scroll: true,
-        };
-        let lua = cfg.to_lua();
-        assert!(lua.starts_with("hl.config({ input = {"));
-        assert!(lua.contains(r#"kb_layout = "fr""#));
-        assert!(lua.contains(r#"kb_variant = "oss""#));
-        assert!(lua.contains("natural_scroll = false"));
-        assert!(lua.contains("touchpad = { natural_scroll = true }"));
-    }
-
-    #[test]
     fn a_layout_is_the_one_thing_that_cannot_be_empty() {
         let mut cfg = InputConfig {
             kb_variant: String::new(),
@@ -339,46 +252,5 @@ mod tests {
         assert!(cfg.validate().is_ok());
         cfg.kb_layout = "  ".into();
         assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn live_values_are_read_from_the_compositor() {
-        let backend = FakeBackend::with_options(&[
-            (
-                "input:kb_layout",
-                r#"{"option":"input:kb_layout","str":"fr","set":true}"#,
-            ),
-            (
-                "input:kb_variant",
-                r#"{"option":"input:kb_variant","str":"[[EMPTY]]","set":false}"#,
-            ),
-            (
-                "input:kb_options",
-                r#"{"option":"input:kb_options","str":"compose:ralt","set":true}"#,
-            ),
-            (
-                "input:natural_scroll",
-                r#"{"option":"input:natural_scroll","bool":false,"set":false}"#,
-            ),
-            (
-                "input:touchpad:natural_scroll",
-                r#"{"option":"input:touchpad:natural_scroll","bool":true,"set":true}"#,
-            ),
-        ]);
-        let cfg = InputConfig::read(&backend).unwrap();
-        assert_eq!(cfg.kb_layout, "fr");
-        assert_eq!(cfg.kb_variant, "", "[[EMPTY]] is not a variant name");
-        assert_eq!(cfg.kb_options, "compose:ralt");
-        assert!(!cfg.natural_scroll);
-        assert!(cfg.touchpad_natural_scroll);
-    }
-
-    #[test]
-    fn applying_sends_one_eval() {
-        let backend = FakeBackend::default();
-        InputConfig::default().apply(&backend).unwrap();
-        let sent = backend.sent_commands();
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].starts_with("/eval hl.config({ input = {"));
     }
 }

@@ -1,10 +1,14 @@
-//! Talks to Hyprland over its two UNIX sockets, without going through
-//! `hyprctl`.
+//! Hyprland's wire protocol, without going through `hyprctl`.
 //!
 //! * `.socket.sock`  — requests/commands. One connection per command: write
 //!   the command, read the response until EOF.
 //! * `.socket2.sock` — event stream. Long-lived connection, lines shaped like
 //!   `EVENT>>DATA\n`.
+//!
+//! This is the *transport* only: which bytes go down the socket and what comes
+//! back. What to ask for lives one level up, in [`super::HyprSession`], and the
+//! split is what lets tests stub the wire without a compositor. See
+//! `docs/writing-a-plugin.md` for the shape a new compositor follows.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -14,61 +18,34 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use rust_i18n::t;
 
+use crate::input::InputConfig;
 use crate::monitor::Monitor;
+use crate::session::CompositorEvent;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Abstraction over the transport to Hyprland.
+/// One request down Hyprland's command socket, one reply back.
 ///
-/// The rest of the program only depends on this trait, which lets us test
-/// the business logic without a running compositor.
-pub trait HyprBackend: Send + Sync {
+/// A trait with a single method so tests can stub the wire; [`HyprSocket`] is
+/// the real thing.
+pub trait Transport: Send + Sync {
     /// Sends a raw command and returns the textual response.
     fn query(&self, cmd: &str) -> Result<String>;
 
-    /// Applies several commands in a single Hyprland transaction.
-    ///
-    /// Beware: Hyprland splits a batch on `;`, so this is only usable for
-    /// commands that cannot contain one — Lua code notably cannot go
-    /// through here.
-    fn batch(&self, cmds: &[String]) -> Result<String> {
-        if cmds.is_empty() {
-            return Ok(String::new());
+    /// Sends one request and fails if Hyprland rejected it.
+    fn send(&self, request: &str) -> Result<()> {
+        if request.trim().is_empty() {
+            return Ok(());
         }
-        self.query(&format!("[[BATCH]]{}", cmds.join(";")))
+        let reply = self.query(request)?;
+        check_ok(&reply, &[request.to_string()])
     }
 
-    /// State of all outputs, including the disabled ones.
+    /// Outputs as `j/monitors all` reports them, disabled ones included.
     fn monitors(&self) -> Result<Vec<Monitor>> {
         let raw = self.query("j/monitors all")?;
         serde_json::from_str(&raw)
             .with_context(|| t!("ipc.unexpected_response", body = truncate(&raw)).to_string())
-    }
-
-    /// Applies a series of `hl.monitor{…}` calls and checks that none of
-    /// them were rejected.
-    ///
-    /// Since Hyprland 0.55 the configuration is Lua and `keyword` is
-    /// refused outright ("keyword can't work with non-legacy parsers"), so
-    /// everything goes through `eval`. All the calls travel in a *single*
-    /// request: `[[BATCH]]` would cut the Lua in half at the first `;`, and
-    /// one request also means the compositor reconfigures the outputs once
-    /// rather than once per screen.
-    fn set_monitors(&self, calls: &[String]) -> Result<()> {
-        if calls.is_empty() {
-            return Ok(());
-        }
-        let reply = self.query(&format!("/eval {}", calls.join(" ")))?;
-        check_ok(&reply, calls)
-    }
-
-    /// Runs one Lua statement and fails if the compositor rejected it.
-    ///
-    /// Same road as [`Self::set_monitors`], for the settings that are not
-    /// monitors — keyboard and pointer (see [`crate::input`]).
-    fn eval(&self, lua: &str) -> Result<()> {
-        let reply = self.query(&format!("/eval {lua}"))?;
-        check_ok(&reply, &[lua.to_string()])
     }
 }
 
@@ -178,7 +155,7 @@ impl HyprSocket {
     }
 }
 
-impl HyprBackend for HyprSocket {
+impl Transport for HyprSocket {
     fn query(&self, cmd: &str) -> Result<String> {
         let path = self.request_socket();
         let mut stream =
@@ -199,76 +176,111 @@ impl HyprBackend for HyprSocket {
     }
 }
 
-/// Events from socket 2 that we care about.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HyprEvent {
-    /// An output appeared (connector name).
-    MonitorAdded(String),
-    /// An output disappeared (connector name).
-    MonitorRemoved(String),
-    /// The configuration was reloaded: the state may have changed under us.
-    ConfigReloaded,
-    /// Everything else, kept for verbose logging.
-    Other(String),
+/// Parses a line of `.socket2.sock`, shaped like `EVENT>>DATA`.
+pub fn parse_event(line: &str) -> Option<CompositorEvent> {
+    let (event, data) = line.split_once(">>")?;
+    Some(match event {
+        // `monitoraddedv2` carries "ID,NAME,DESCRIPTION"; we only keep the name.
+        "monitoraddedv2" => {
+            let mut parts = data.splitn(3, ',');
+            let _id = parts.next();
+            CompositorEvent::OutputAdded(parts.next().unwrap_or_default().to_string())
+        }
+        "monitoradded" => CompositorEvent::OutputAdded(data.to_string()),
+        "monitorremoved" | "monitorremovedv2" => {
+            // The v2 variant carries "ID,NAME,DESCRIPTION".
+            let name = if event.ends_with("v2") {
+                data.split(',').nth(1).unwrap_or_default().to_string()
+            } else {
+                data.to_string()
+            };
+            CompositorEvent::OutputRemoved(name)
+        }
+        "configreloaded" => CompositorEvent::ConfigReloaded,
+        _ => CompositorEvent::Other(line.to_string()),
+    })
 }
 
-impl HyprEvent {
-    /// Parses a line shaped like `EVENT>>DATA`.
-    pub fn parse(line: &str) -> Option<Self> {
-        let (event, data) = line.split_once(">>")?;
-        Some(match event {
-            // `monitoraddedv2` carries "ID,NAME,DESCRIPTION"; we only keep the name.
-            "monitoraddedv2" => {
-                let mut parts = data.splitn(3, ',');
-                let _id = parts.next();
-                let name = parts.next().unwrap_or_default().to_string();
-                HyprEvent::MonitorAdded(name)
-            }
-            "monitoradded" => HyprEvent::MonitorAdded(data.to_string()),
-            "monitorremoved" | "monitorremovedv2" => {
-                // The v2 variant carries "ID,NAME,DESCRIPTION".
-                let name = if event.ends_with("v2") {
-                    data.split(',').nth(1).unwrap_or_default().to_string()
-                } else {
-                    data.to_string()
-                };
-                HyprEvent::MonitorRemoved(name)
-            }
-            "configreloaded" => HyprEvent::ConfigReloaded,
-            _ => HyprEvent::Other(line.to_string()),
+/// Blocking reader over `.socket2.sock`.
+///
+/// Blocking on purpose: see [`crate::session::EventStream`]. Hyprland's stream
+/// is one event per line, so a `BufReader` is the whole implementation.
+pub struct Events {
+    lines: std::io::Lines<std::io::BufReader<UnixStream>>,
+}
+
+impl Events {
+    pub fn connect(socket: &Path) -> Result<Self> {
+        let stream =
+            UnixStream::connect(socket).with_context(|| t!("ipc.unreachable").to_string())?;
+        Ok(Self {
+            lines: std::io::BufRead::lines(std::io::BufReader::new(stream)),
         })
     }
+}
 
-    /// An event that should trigger a profile re-evaluation.
-    pub fn affects_monitors(&self) -> bool {
-        matches!(
-            self,
-            HyprEvent::MonitorAdded(_) | HyprEvent::MonitorRemoved(_)
-        )
+impl crate::session::EventStream for Events {
+    fn next_event(&mut self) -> Option<CompositorEvent> {
+        // A line we cannot parse is not the end of the stream: skip it and keep
+        // reading, or one odd event would stop hotplug for the whole session.
+        loop {
+            match self.lines.next() {
+                Some(Ok(line)) => {
+                    if let Some(event) = parse_event(&line) {
+                        return Some(event);
+                    }
+                }
+                Some(Err(_)) | None => return None,
+            }
+        }
     }
 }
 
-/// Opens the event stream and invokes `on_event` for every line.
+/// The keyboard and pointer settings Hyprland currently reports.
 ///
-/// The function only returns once the socket closes (Hyprland restarting) or
-/// `on_event` returns an error.
-pub async fn stream_events<F>(socket: &Path, mut on_event: F) -> Result<()>
-where
-    F: FnMut(HyprEvent) -> Result<()>,
-{
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::net::UnixStream as AsyncUnixStream;
+/// The live state is the source of truth: the user may well have set `kb_layout`
+/// by hand in `hyprland.lua` long before hyprdmc existed, and the UI must show
+/// that rather than a default we invented.
+pub fn read_input(wire: &dyn Transport) -> Result<InputConfig> {
+    Ok(InputConfig {
+        kb_layout: get_string(wire, "input:kb_layout")?,
+        kb_variant: get_string(wire, "input:kb_variant")?,
+        kb_options: get_string(wire, "input:kb_options")?,
+        natural_scroll: get_bool(wire, "input:natural_scroll")?,
+        touchpad_natural_scroll: get_bool(wire, "input:touchpad:natural_scroll")?,
+    })
+}
 
-    let stream = AsyncUnixStream::connect(socket)
-        .await
-        .with_context(|| t!("ipc.unreachable").to_string())?;
-    let mut lines = BufReader::new(stream).lines();
-    while let Some(line) = lines.next_line().await? {
-        if let Some(event) = HyprEvent::parse(&line) {
-            on_event(event)?;
-        }
-    }
-    Ok(())
+/// Reads a string option through `getoption`.
+fn get_string(backend: &dyn Transport, option: &str) -> Result<String> {
+    let value = get_option(backend, option)?;
+    Ok(value
+        .get("str")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        // Hyprland reports an unset string option as the literal
+        // `[[EMPTY]]`, which is not something to show in a text field.
+        .replace("[[EMPTY]]", "")
+        .to_string())
+}
+
+/// Reads a boolean option through `getoption`.
+///
+/// Hyprland answers with `bool` for these, but older versions used `int`;
+/// both are accepted so a version bump does not silently read as `false`.
+fn get_bool(backend: &dyn Transport, option: &str) -> Result<bool> {
+    let value = get_option(backend, option)?;
+    Ok(value
+        .get("bool")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| value.get("int").and_then(|v| v.as_i64()).map(|i| i != 0))
+        .unwrap_or(false))
+}
+
+fn get_option(wire: &dyn Transport, option: &str) -> Result<serde_json::Value> {
+    let raw = wire.query(&format!("j/getoption {option}"))?;
+    serde_json::from_str(&raw)
+        .with_context(|| t!("input.unreadable_option", option = option).to_string())
 }
 
 #[cfg(test)]
@@ -276,10 +288,10 @@ pub mod fake {
     //! Test backend: replays canned responses and records the commands sent.
 
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
-    pub struct FakeBackend {
+    pub struct FakeTransport {
         pub monitors_json: Mutex<String>,
         pub sent: Mutex<Vec<String>>,
         pub fail_with: Mutex<Option<String>>,
@@ -291,7 +303,7 @@ pub mod fake {
         options: Mutex<Vec<(String, String)>>,
     }
 
-    impl FakeBackend {
+    impl FakeTransport {
         pub fn with_monitors(json: &str) -> Self {
             Self {
                 monitors_json: Mutex::new(json.to_string()),
@@ -338,7 +350,58 @@ pub mod fake {
         }
     }
 
-    impl HyprBackend for FakeBackend {
+    /// A [`Session`](crate::session::Session) over a stubbed wire.
+    pub struct FakeSession {
+        pub(super) inner: super::super::HyprSession,
+        pub(super) wire: Arc<FakeTransport>,
+    }
+
+    impl FakeSession {
+        pub fn with_monitors(json: &str) -> Self {
+            Self::build(Arc::new(FakeTransport::with_monitors(json)))
+        }
+
+        pub fn with_options(options: &[(&str, &str)]) -> Self {
+            Self::build(Arc::new(FakeTransport::with_options(options)))
+        }
+
+        pub fn settling_after(repeats: usize, stale: &str, settled: &str) -> Self {
+            Self::build(Arc::new(FakeTransport::settling_after(
+                repeats, stale, settled,
+            )))
+        }
+
+        pub fn sent_commands(&self) -> Vec<String> {
+            self.wire.sent_commands()
+        }
+
+        pub fn monitor_reads(&self) -> usize {
+            self.wire.monitor_reads()
+        }
+    }
+
+    impl crate::session::Session for FakeSession {
+        fn outputs(&self) -> Result<Vec<Monitor>> {
+            self.inner.outputs()
+        }
+        fn apply(&self, directives: &[String]) -> Result<()> {
+            self.inner.apply(directives)
+        }
+        fn focus(&self, output: &str) -> Result<()> {
+            self.inner.focus(output)
+        }
+        fn read_input(&self) -> Result<InputConfig> {
+            self.inner.read_input()
+        }
+        fn apply_input(&self, input: &InputConfig) -> Result<()> {
+            self.inner.apply_input(input)
+        }
+        fn watch(&self) -> Result<Box<dyn crate::session::EventStream>> {
+            self.inner.watch()
+        }
+    }
+
+    impl Transport for FakeTransport {
         fn query(&self, cmd: &str) -> Result<String> {
             self.sent.lock().unwrap().push(cmd.to_string());
             if let Some(err) = self.fail_with.lock().unwrap().clone() {
@@ -377,81 +440,58 @@ mod tests {
     #[test]
     fn parses_monitor_added_v2() {
         assert_eq!(
-            HyprEvent::parse("monitoraddedv2>>1,DP-1,Dell Inc. U2723QE ABC"),
-            Some(HyprEvent::MonitorAdded("DP-1".into()))
+            parse_event("monitoraddedv2>>1,DP-1,Dell Inc. U2723QE ABC"),
+            Some(CompositorEvent::OutputAdded("DP-1".into()))
         );
     }
 
     #[test]
     fn parses_monitor_added_v1() {
         assert_eq!(
-            HyprEvent::parse("monitoradded>>DP-1"),
-            Some(HyprEvent::MonitorAdded("DP-1".into()))
+            parse_event("monitoradded>>DP-1"),
+            Some(CompositorEvent::OutputAdded("DP-1".into()))
         );
     }
 
     #[test]
     fn parses_monitor_removed_both_variants() {
         assert_eq!(
-            HyprEvent::parse("monitorremoved>>DP-1"),
-            Some(HyprEvent::MonitorRemoved("DP-1".into()))
+            parse_event("monitorremoved>>DP-1"),
+            Some(CompositorEvent::OutputRemoved("DP-1".into()))
         );
         assert_eq!(
-            HyprEvent::parse("monitorremovedv2>>1,DP-1,Dell"),
-            Some(HyprEvent::MonitorRemoved("DP-1".into()))
+            parse_event("monitorremovedv2>>1,DP-1,Dell"),
+            Some(CompositorEvent::OutputRemoved("DP-1".into()))
         );
     }
 
     #[test]
     fn unrelated_events_are_ignored_by_the_daemon() {
-        let ev = HyprEvent::parse("workspace>>2").unwrap();
-        assert!(!ev.affects_monitors());
-        assert!(
-            HyprEvent::parse("monitoradded>>DP-1")
-                .unwrap()
-                .affects_monitors()
-        );
+        assert!(!parse_event("workspace>>2").unwrap().affects_outputs());
+        assert!(parse_event("monitoradded>>DP-1").unwrap().affects_outputs());
     }
 
     #[test]
     fn malformed_lines_yield_nothing() {
-        assert_eq!(HyprEvent::parse("no separator"), None);
+        assert_eq!(parse_event("no separator"), None);
     }
 
     #[test]
-    fn batch_joins_commands() {
-        let fake = fake::FakeBackend::default();
-        fake.batch(&["dispatch A".into(), "dispatch B".into()])
-            .unwrap();
-        assert_eq!(fake.sent_commands(), vec!["[[BATCH]]dispatch A;dispatch B"]);
+    fn a_request_is_sent_verbatim() {
+        // The transport does not compose requests: whatever the plugin phrased
+        // is what goes on the wire, `;` and all — a `[[BATCH]]` here would cut
+        // Lua in half at the first one.
+        let fake = fake::FakeTransport::default();
+        let request = "/eval hl.monitor({ output = \"A\" }) hl.monitor({ output = \"B\" })";
+        fake.send(request).unwrap();
+        assert_eq!(fake.sent_commands(), vec![request]);
     }
 
     #[test]
-    fn empty_batch_is_a_no_op() {
-        let fake = fake::FakeBackend::default();
-        fake.batch(&[]).unwrap();
-        assert!(fake.sent_commands().is_empty());
-    }
-
-    #[test]
-    fn monitors_are_applied_through_a_single_eval() {
-        // A batch would split the Lua on its first `;`.
-        let fake = fake::FakeBackend::default();
-        fake.set_monitors(&[
-            "hl.monitor({ output = \"A\" })".into(),
-            "hl.monitor({ output = \"B\" })".into(),
-        ])
-        .unwrap();
-        assert_eq!(
-            fake.sent_commands(),
-            vec!["/eval hl.monitor({ output = \"A\" }) hl.monitor({ output = \"B\" })"]
-        );
-    }
-
-    #[test]
-    fn applying_nothing_touches_no_socket() {
-        let fake = fake::FakeBackend::default();
-        fake.set_monitors(&[]).unwrap();
+    fn an_empty_request_touches_no_socket() {
+        let fake = fake::FakeTransport::default();
+        fake.send("").unwrap();
+        fake.send("   ").unwrap();
         assert!(fake.sent_commands().is_empty());
     }
 
@@ -462,5 +502,20 @@ mod tests {
         assert!(err.to_string().contains("error applying field"));
         assert!(check_ok("ok", &cmds).is_ok());
         assert!(check_ok("ok\n\n\nok", &cmds).is_ok());
+    }
+}
+
+#[cfg(test)]
+impl fake::FakeSession {
+    /// A session whose wire is stubbed, with the recorder still reachable.
+    ///
+    /// Wraps a *real* [`super::HyprSession`] rather than reimplementing it, so
+    /// tests that assert on the bytes sent are asserting the production
+    /// formatting and not a double's imitation of it.
+    fn build(wire: std::sync::Arc<fake::FakeTransport>) -> Self {
+        Self {
+            inner: super::HyprSession::with_transport(wire.clone()),
+            wire,
+        }
     }
 }

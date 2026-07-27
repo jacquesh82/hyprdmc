@@ -58,6 +58,26 @@ pub enum Command {
         safety: SafetyArgs,
     },
 
+    /// Shows or sets the main screen among the detected ones.
+    ///
+    /// The main screen anchors the workspace at 0x0, opens the row when the
+    /// outputs are arranged automatically, and takes the focus after an apply.
+    Primary {
+        /// Connector name, fingerprint or `*` pattern. Omit to show the current
+        /// choice.
+        output: Option<String>,
+
+        /// Forget the main screen: back to anchoring on the top-left corner.
+        #[arg(long, conflicts_with = "output")]
+        none: bool,
+
+        #[command(flatten)]
+        safety: SafetyArgs,
+    },
+
+    /// Lists the compositor plugins and says which one is in force.
+    Compositor,
+
     /// Profile management.
     Profile {
         #[command(subcommand)]
@@ -79,7 +99,7 @@ pub enum Command {
         action: Option<HistoryAction>,
     },
 
-    /// Wires `monitors.lua` and `input.lua` into `hyprland.lua`.
+    /// Wires `monitors.lua` and `inputs.lua` into `hyprland.lua`.
     Init {
         /// Shows what would be done without changing anything.
         #[arg(long)]
@@ -136,7 +156,7 @@ pub enum ServiceAction {
 
 #[derive(Debug, Args)]
 pub struct WebArgs {
-    /// Listening port (default: the one from the configuration, 8787).
+    /// Listening port (default: the one from the configuration, 28787).
     #[arg(short, long)]
     pub port: Option<u16>,
 

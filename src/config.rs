@@ -15,6 +15,12 @@ use crate::monitor::{Mode, Monitor, Rotation, Transform};
 #[serde(default)]
 pub struct Settings {
     /// Listening port for the web interface.
+    ///
+    /// Deliberately high: a developer machine already has something on 3000,
+    /// 8000, 8080 and 8787, and a UI that refuses to start because a dev server
+    /// got there first is a bad first impression. Below 32768 all the same, so
+    /// it never lands in the ephemeral range the kernel hands out to outgoing
+    /// connections.
     pub web_port: u16,
     /// Listening address. Local by default: the API drives the display, it
     /// has no business being on the network without an explicit decision.
@@ -24,11 +30,25 @@ pub struct Settings {
     /// Delay before automatically reverting if the user does not confirm.
     /// `0` disables the safety net.
     pub confirm_timeout_secs: u64,
-    /// Generated file, to be required from `hyprland.lua`.
-    #[serde(alias = "monitors_conf")]
+    /// Which compositor plugin turns a layout into a configuration file.
+    ///
+    /// `None` or `"auto"` detects it from the session; see
+    /// [`crate::compositor::resolve`]. Set it explicitly when hyprdmc runs
+    /// somewhere the environment does not say — a systemd unit started before
+    /// the session, say — or to generate another compositor's file on purpose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compositor: Option<String>,
+    /// Generated file, to be pulled into the compositor's own configuration.
+    ///
+    /// The `_lua` in the name is history — it predates the plugins, and renaming
+    /// it would break every `config.toml` already written. `monitors_file` is
+    /// accepted as a synonym for anyone whose compositor reads no Lua at all.
+    /// Unset, it defaults to the active plugin's own path.
+    #[serde(alias = "monitors_conf", alias = "monitors_file")]
     pub monitors_lua: PathBuf,
     /// Generated file for the keyboard and pointer settings. Separate from
     /// `monitors_lua` so that rewriting one never touches the other.
+    #[serde(alias = "input_conf", alias = "input_file")]
     pub input_lua: PathBuf,
     /// Interface language (`en`, `fr`). Unset means "follow the system
     /// locale"; see [`crate::i18n`] for the full resolution order.
@@ -39,20 +59,31 @@ pub struct Settings {
     /// Reuse the layout last applied with the same set of outputs when no
     /// named profile matches. This is what makes redocking just work.
     pub remember: bool,
+    /// The screen the user calls their main one.
+    ///
+    /// Designated the same way a profile rule designates an output — connector
+    /// name, fingerprint, or a pattern with `*` — rather than by connector
+    /// alone, so the choice survives being plugged into another port. Global
+    /// rather than per-profile on purpose: which screen you sit in front of is a
+    /// property of your desk, not of an arrangement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            web_port: 8787,
+            web_port: 28787,
             bind: "127.0.0.1".to_string(),
             auto_apply: true,
             confirm_timeout_secs: 10,
+            compositor: None,
             monitors_lua: default_monitors_lua(),
             input_lua: default_input_lua(),
             language: None,
             notifications: true,
             remember: true,
+            primary: None,
         }
     }
 }
@@ -111,9 +142,7 @@ impl OutputRule {
 
     /// Does this rule designate this output?
     pub fn matches(&self, m: &Monitor) -> bool {
-        m.identifiers()
-            .iter()
-            .any(|id| glob_match(&self.pattern, id))
+        matches_pattern(&self.pattern, m)
     }
 
     fn to_state(&self, connector: &str) -> Result<OutputState> {
@@ -142,6 +171,14 @@ impl OutputRule {
     fn auto_position(&self) -> bool {
         matches!(self.position.as_deref(), None | Some("") | Some("auto"))
     }
+}
+
+/// Does `pattern` designate this output?
+///
+/// Shared by profile rules and by the main-screen setting, so both accept the
+/// same three forms: a connector name, a fingerprint, or a `*` pattern.
+pub fn matches_pattern(pattern: &str, m: &Monitor) -> bool {
+    m.identifiers().iter().any(|id| glob_match(pattern, id))
 }
 
 /// Parses `"1920x0"` or `"1920,0"`.
@@ -331,6 +368,32 @@ impl Config {
         Ok(())
     }
 
+    /// Connector name of the main screen among the connected outputs.
+    ///
+    /// `None` when no main screen is set, or when the one that is set is not
+    /// plugged in right now — a laptop that names its desk monitor as the main
+    /// screen goes back to a plain layout on the train, rather than anchoring
+    /// itself on something that is not there.
+    ///
+    /// An output that is switched on wins over one that is not: a pattern loose
+    /// enough to match several screens should land on one you can actually see.
+    pub fn primary_output(&self, monitors: &[Monitor]) -> Option<String> {
+        let pattern = self.settings.primary.as_deref()?;
+        let matching = || monitors.iter().filter(|m| matches_pattern(pattern, m));
+        matching()
+            .find(|m| !m.disabled)
+            .or_else(|| matching().next())
+            .map(|m| m.name.clone())
+    }
+
+    /// The compositor plugin this configuration asks for.
+    ///
+    /// Fails only on a name no plugin answers to; an unset or `"auto"` value
+    /// detects the running session — see [`crate::compositor::resolve`].
+    pub fn compositor(&self) -> Result<&'static (dyn crate::compositor::Compositor + Sync)> {
+        crate::compositor::resolve(self.settings.compositor.as_deref())
+    }
+
     /// Best profile for the connected hardware.
     ///
     /// The profile covering the most outputs wins; ties go to the first one
@@ -391,24 +454,22 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// The plugin whose defaults apply before `config.toml` has been read.
+///
+/// Detection only — the configured preference lives in the very struct being
+/// defaulted, so consulting it here would be circular. A path already written to
+/// `config.toml` always wins over this, which is what keeps a file authored on
+/// one compositor pointing where its author meant.
+fn detected() -> &'static (dyn crate::compositor::Compositor + Sync) {
+    crate::compositor::resolve(None).expect("resolve falls back rather than failing")
+}
+
 fn default_monitors_lua() -> PathBuf {
-    hypr_dir().join("monitors.lua")
+    detected().monitors_path()
 }
 
 fn default_input_lua() -> PathBuf {
-    hypr_dir().join("input.lua")
-}
-
-/// The user's main configuration file. Lua since Hyprland 0.55.
-pub fn hyprland_lua() -> PathBuf {
-    hypr_dir().join("hyprland.lua")
-}
-
-fn hypr_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"))
-        .join("hypr")
+    detected().input_path()
 }
 
 pub fn home() -> PathBuf {
@@ -711,9 +772,53 @@ mod tests {
     }
 
     #[test]
+    fn the_main_screen_is_resolved_to_a_connector() {
+        let mut cfg = Config::default();
+        // Stored as a fingerprint, so moving the cable does not lose the choice.
+        cfg.settings.primary = Some("Dell Inc. U2723QE ABC".into());
+        let monitors = vec![
+            monitor("eDP-1", "AU", "X", ""),
+            monitor("DP-4", "Dell Inc.", "U2723QE", "ABC"),
+        ];
+        assert_eq!(cfg.primary_output(&monitors), Some("DP-4".to_string()));
+
+        // Unplugged: no main screen rather than an anchor on nothing.
+        assert_eq!(cfg.primary_output(&monitors[..1]), None);
+        assert_eq!(Config::default().primary_output(&monitors), None);
+    }
+
+    #[test]
+    fn a_loose_main_screen_pattern_prefers_a_screen_that_is_on() {
+        let mut cfg = Config::default();
+        cfg.settings.primary = Some("Dell*".into());
+        let mut off = monitor("DP-1", "Dell Inc.", "U2723QE", "ABC");
+        off.disabled = true;
+        let on = monitor("DP-2", "Dell Inc.", "U2723QE", "DEF");
+        assert_eq!(
+            cfg.primary_output(&[off, on]),
+            Some("DP-2".to_string()),
+            "a main screen you cannot see is not much of a main screen"
+        );
+    }
+
+    #[test]
+    fn the_main_screen_survives_a_round_trip_through_toml() {
+        let mut cfg = Config::default();
+        cfg.settings.primary = Some("Dell Inc. U2723QE ABC".into());
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            back.settings.primary.as_deref(),
+            Some("Dell Inc. U2723QE ABC")
+        );
+        // Unset, it stays out of the file entirely rather than writing `primary = ""`.
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("primary"), "{text}");
+    }
+
+    #[test]
     fn missing_config_file_yields_defaults() {
         let cfg = Config::load_from(Path::new("/nonexistent/hyprdmc/config.toml")).unwrap();
         assert!(cfg.profiles.is_empty());
-        assert_eq!(cfg.settings.web_port, 8787);
+        assert_eq!(cfg.settings.web_port, 28787);
     }
 }

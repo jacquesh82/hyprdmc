@@ -100,57 +100,6 @@ impl OutputState {
     pub fn occupies_space(&self) -> bool {
         self.enabled && self.mirror_of.is_none()
     }
-
-    /// Renders the `hl.monitor{…}` call that configures this output.
-    ///
-    /// Hyprland's Lua rules are cumulative: a field left out keeps whatever
-    /// an earlier call gave it. Every field we own is therefore always
-    /// written out, otherwise a mirror or a rotation would survive its own
-    /// removal.
-    pub fn to_lua(&self) -> String {
-        if !self.enabled {
-            return format!(
-                "hl.monitor({{ output = {}, disabled = true }})",
-                lua_string(&self.name)
-            );
-        }
-        let mode = match self.mode {
-            Some(m) => m.to_string(),
-            None => "preferred".to_string(),
-        };
-        format!(
-            "hl.monitor({{ output = {}, mode = {}, position = \"{}x{}\", \
-             scale = {}, transform = {}, mirror = {}, vrr = {}, disabled = false }})",
-            lua_string(&self.name),
-            lua_string(&mode),
-            self.x,
-            self.y,
-            format_scale(self.scale),
-            self.transform.to_u8(),
-            lua_string(self.mirror_of.as_deref().unwrap_or("")),
-            u8::from(self.vrr),
-        )
-    }
-}
-
-/// Quotes a value as a Lua string literal.
-///
-/// Output names come from the compositor and profile rules come from the
-/// user: neither is trusted to be free of quotes or backslashes.
-pub fn lua_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Formats a scale without trailing noise: `1`, `1.5`, `1.333333`.
@@ -197,14 +146,36 @@ impl fmt::Display for Issue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub outputs: Vec<OutputState>,
+    /// Connector name of the main screen, when the user has designated one.
+    ///
+    /// Hyprland has no notion of a "primary" output, so this is ours: the main
+    /// screen anchors the workspace at (0, 0), opens the row when the outputs
+    /// are arranged automatically, and takes the focus once a layout is
+    /// applied. `None` restores the plain behaviour — the layout is anchored on
+    /// its own top-left corner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
 }
 
 impl Layout {
     pub fn new(outputs: Vec<OutputState>) -> Self {
-        Self { outputs }
+        Self {
+            outputs,
+            primary: None,
+        }
+    }
+
+    /// Same, designating the main screen by connector name.
+    pub fn with_primary(mut self, primary: Option<String>) -> Self {
+        self.primary = primary;
+        self
     }
 
     /// Layout reflecting the live state.
+    ///
+    /// The main screen is left unset: it is a choice of the user's, recorded in
+    /// `config.toml`, and nothing in what the compositor reports could tell us
+    /// what it is — see [`crate::config::Config::primary_output`].
     pub fn from_monitors(monitors: &[Monitor]) -> Self {
         Self::new(
             monitors
@@ -212,6 +183,17 @@ impl Layout {
                 .map(|m| OutputState::from_monitor(m, monitors))
                 .collect(),
         )
+    }
+
+    /// The main screen, when one is set *and* it is usable as an anchor.
+    ///
+    /// A screen that is off — or mirroring another one, and therefore sitting
+    /// on top of it — takes up no space of its own and cannot anchor anything.
+    pub fn primary_output(&self) -> Option<&OutputState> {
+        self.primary
+            .as_deref()
+            .and_then(|name| self.get(name))
+            .filter(|o| o.occupies_space())
     }
 
     pub fn get(&self, name: &str) -> Option<&OutputState> {
@@ -224,11 +206,6 @@ impl Layout {
 
     pub fn active(&self) -> impl Iterator<Item = &OutputState> {
         self.outputs.iter().filter(|o| o.occupies_space())
-    }
-
-    /// Hyprland directives for the entire layout.
-    pub fn to_lua_calls(&self) -> Vec<String> {
-        self.outputs.iter().map(OutputState::to_lua).collect()
     }
 
     pub fn has_errors(&self) -> bool {
@@ -368,28 +345,64 @@ impl Layout {
             });
         }
 
+        // A main screen that is gone, off, or mirroring another one anchors
+        // nothing: the layout still works, but not around the screen the user
+        // asked for, and that is worth saying out loud.
+        if let Some(name) = &self.primary
+            && self.primary_output().is_none()
+        {
+            issues.push(Issue {
+                severity: Severity::Warning,
+                outputs: vec![name.clone()],
+                message: t!("layout.issue.primary_unavailable", name = name).to_string(),
+            });
+        }
+
         issues
     }
 
-    /// Brings the top-left corner of the whole layout back to (0, 0).
+    /// Brings the layout back to (0, 0).
+    ///
+    /// Without a main screen, that means its top-left corner. With one, it
+    /// means the main screen itself: it becomes the origin of the workspace and
+    /// everything to its left or above it takes negative coordinates, which
+    /// Hyprland accepts. That is the whole point of designating a main screen —
+    /// the coordinate space is built around it, so whatever reads the output at
+    /// (0, 0) lands on the one the user calls their main one.
     pub fn normalize(&mut self) {
-        let min_x = self.active().map(|o| o.x).min().unwrap_or(0);
-        let min_y = self.active().map(|o| o.y).min().unwrap_or(0);
-        if min_x == 0 && min_y == 0 {
+        let (dx, dy) = match self.primary_output() {
+            Some(anchor) => (anchor.x, anchor.y),
+            None => (
+                self.active().map(|o| o.x).min().unwrap_or(0),
+                self.active().map(|o| o.y).min().unwrap_or(0),
+            ),
+        };
+        if dx == 0 && dy == 0 {
             return;
         }
         for o in self.outputs.iter_mut().filter(|o| o.occupies_space()) {
-            o.x -= min_x;
-            o.y -= min_y;
+            o.x -= dx;
+            o.y -= dy;
         }
     }
 
     /// Lines up the active outputs side by side, left to right, top-aligned.
     ///
-    /// This is the fallback when no profile matches the connected hardware.
+    /// This is the fallback when no profile matches the connected hardware. The
+    /// main screen opens the row: "left to right" has to start somewhere, and
+    /// starting anywhere else would put the user's main screen off to the side.
     pub fn auto_arrange(&mut self) {
+        let primary = self.primary.clone();
+        let mut order: Vec<usize> = (0..self.outputs.len())
+            .filter(|&i| self.outputs[i].occupies_space())
+            .collect();
+        // Stable sort: everything that is not the main screen keeps its
+        // declaration order, which is the order Hyprland reports the outputs in.
+        order.sort_by_key(|&i| usize::from(Some(&self.outputs[i].name) != primary.as_ref()));
+
         let mut cursor = 0;
-        for o in self.outputs.iter_mut().filter(|o| o.occupies_space()) {
+        for i in order {
+            let o = &mut self.outputs[i];
             o.x = cursor;
             o.y = 0;
             cursor += o.logical_size_rounded().0;
@@ -540,57 +553,6 @@ mod tests {
         let mut o = out("DP-1", 1920, 1080, 0, 0);
         o.transform = Transform::new(Rotation::R0, true);
         assert_eq!(o.logical_size_rounded(), (1920, 1080));
-    }
-
-    #[test]
-    fn lua_call_always_states_every_field_it_owns() {
-        // Cumulative rules: omitting a field would let the previous value
-        // survive, so defaults are spelled out too.
-        let o = out("eDP-1", 1920, 1080, 0, 0);
-        assert_eq!(
-            o.to_lua(),
-            "hl.monitor({ output = \"eDP-1\", mode = \"1920x1080@60.00\", position = \"0x0\", \
-             scale = 1, transform = 0, mirror = \"\", vrr = 0, disabled = false })"
-        );
-    }
-
-    #[test]
-    fn lua_call_carries_transform_mirror_and_vrr() {
-        let mut o = out("DP-1", 1920, 1080, 1920, 0);
-        o.transform = Transform::new(Rotation::R90, true);
-        o.mirror_of = Some("eDP-1".into());
-        o.vrr = true;
-        o.scale = 1.25;
-        assert_eq!(
-            o.to_lua(),
-            "hl.monitor({ output = \"DP-1\", mode = \"1920x1080@60.00\", position = \"1920x0\", \
-             scale = 1.25, transform = 5, mirror = \"eDP-1\", vrr = 1, disabled = false })"
-        );
-    }
-
-    #[test]
-    fn disabled_output_only_states_that_it_is_off() {
-        let mut o = out("eDP-1", 1920, 1080, 0, 0);
-        o.enabled = false;
-        assert_eq!(
-            o.to_lua(),
-            "hl.monitor({ output = \"eDP-1\", disabled = true })"
-        );
-    }
-
-    #[test]
-    fn lua_strings_escape_quotes_and_backslashes() {
-        assert_eq!(
-            lua_string(r#"desc:Acme "X" \ 1"#),
-            r#""desc:Acme \"X\" \\ 1""#
-        );
-    }
-
-    #[test]
-    fn output_without_a_mode_falls_back_to_preferred() {
-        let mut o = out("eDP-1", 1920, 1080, 0, 0);
-        o.mode = None;
-        assert!(o.to_lua().contains("mode = \"preferred\""));
     }
 
     #[test]
@@ -808,6 +770,69 @@ mod tests {
             (layout.get("B").unwrap().x, layout.get("B").unwrap().y),
             (1920, 0)
         );
+    }
+
+    #[test]
+    fn normalize_anchors_the_layout_on_the_main_screen() {
+        // The main screen becomes the origin, so its neighbour to the left ends
+        // up at a negative coordinate instead of pushing it to the right.
+        let mut layout = Layout::new(vec![
+            out("A", 1920, 1080, 0, 0),
+            out("B", 1920, 1080, 1920, 0),
+        ])
+        .with_primary(Some("B".into()));
+        layout.normalize();
+        assert_eq!(
+            (layout.get("B").unwrap().x, layout.get("B").unwrap().y),
+            (0, 0)
+        );
+        assert_eq!(layout.get("A").unwrap().x, -1920);
+        assert!(!layout.has_errors());
+    }
+
+    #[test]
+    fn a_disabled_main_screen_falls_back_to_the_corner_and_warns() {
+        let mut a = out("A", 1920, 1080, 500, 500);
+        a.enabled = false;
+        let mut layout =
+            Layout::new(vec![a, out("B", 1920, 1080, 500, 500)]).with_primary(Some("A".into()));
+        layout.normalize();
+        // Nothing was anchored on the screen that is off; B is at the corner.
+        assert_eq!(
+            (layout.get("B").unwrap().x, layout.get("B").unwrap().y),
+            (0, 0)
+        );
+        assert!(!layout.has_errors());
+        assert!(
+            layout
+                .validate()
+                .iter()
+                .any(|i| i.severity == Severity::Warning && i.message.contains("main screen"))
+        );
+    }
+
+    #[test]
+    fn an_unknown_main_screen_only_warns() {
+        let layout =
+            Layout::new(vec![out("A", 1920, 1080, 0, 0)]).with_primary(Some("ABSENT".into()));
+        assert!(!layout.has_errors());
+        assert_eq!(layout.validate().len(), 1);
+    }
+
+    #[test]
+    fn auto_arrange_starts_with_the_main_screen() {
+        let mut layout = Layout::new(vec![
+            out("A", 1920, 1080, 0, 0),
+            out("B", 2560, 1440, 0, 0),
+            out("C", 1280, 720, 0, 0),
+        ])
+        .with_primary(Some("B".into()));
+        layout.auto_arrange();
+        assert_eq!(layout.get("B").unwrap().x, 0);
+        // The others keep their reported order behind it.
+        assert_eq!(layout.get("A").unwrap().x, 2560);
+        assert_eq!(layout.get("C").unwrap().x, 2560 + 1920);
+        assert!(!layout.has_errors());
     }
 
     #[test]

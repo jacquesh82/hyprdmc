@@ -39,6 +39,9 @@
     <img src="/icon.svg" alt="" class="app-icon" width="24" height="24">
     <h1>hyprdmc</h1>
     <span id="profile-badge" class="badge" hidden></span>
+    <!-- Which compositor plugin is in force. Worth permanent space: it decides
+         the syntax written to disk and whether applying works at all. -->
+    <span id="compositor-badge" class="badge" hidden></span>
     <span class="spacer"></span>
     <!--
       History lives in a drawer, not in the main column: it is reference
@@ -203,7 +206,7 @@
     </section>
 
     <p class="helper page-note" data-i18n="web.input.note">
-      Applied immediately. “Make permanent” writes input.lua so the settings survive a restart.
+      Applied immediately. “Make permanent” writes inputs.lua so the settings survive a restart.
     </p>
   </main>
 
@@ -316,6 +319,11 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
-  <script src="/app.js"></script>
+  <!-- A module, so that nothing here is a page global. As a classic script
+       every top-level binding — `t`, `el`, `render`, `live`, `draft` — lands on
+       `window`, where any browser extension injecting a script of its own can
+       overwrite it; one that defines its own `t` silently replaces our
+       translator and the settings panel dies mid-render. -->
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

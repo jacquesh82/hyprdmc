@@ -17,13 +17,14 @@ rust_i18n::i18n!("locales", fallback = "en");
 use hyprdmc::apply::{self, ApplyReport};
 use hyprdmc::browser;
 use hyprdmc::cli::{Cli, Command, HistoryAction, ProfileAction, SafetyArgs, SetArgs, WebArgs};
-use hyprdmc::config::{Config, OutputRule, Profile, config_path, hyprland_lua, parse_position};
+use hyprdmc::compositor::{self, Compositor};
+use hyprdmc::config::{Config, OutputRule, Profile, config_path, parse_position};
 use hyprdmc::daemon::{self, AppState};
 use hyprdmc::emit;
 use hyprdmc::history::Store;
-use hyprdmc::ipc::{HyprBackend, HyprSocket};
 use hyprdmc::layout::{Layout, Relation, Severity, format_scale};
 use hyprdmc::monitor::{Mode, Monitor, Rotation, Transform};
+use hyprdmc::session::Session;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +44,12 @@ async fn main() -> Result<()> {
         Command::Set(args) => cmd_set(args),
         Command::Arrange { spec, safety } => cmd_arrange(&spec, safety),
         Command::Auto { safety } => cmd_auto(safety),
+        Command::Primary {
+            output,
+            none,
+            safety,
+        } => cmd_primary(output.as_deref(), none, safety),
+        Command::Compositor => cmd_compositor(),
         Command::Profile { action } => cmd_profile(action),
         Command::Apply { safety } => cmd_apply_for_hardware(safety),
         Command::Persist => cmd_persist(),
@@ -159,14 +166,22 @@ fn init_tracing(verbose: bool) {
         .init();
 }
 
-fn backend() -> Result<HyprSocket> {
-    HyprSocket::connect().context(t!("ipc.unreachable").to_string())
+/// Opens a session on the running compositor, through whichever plugin applies.
+///
+/// The error names the compositor: "Hyprland is not reachable" and "sway is not
+/// reachable" send the user to different places.
+fn session() -> Result<Box<dyn Session>> {
+    let cfg = Config::load()?;
+    let compositor = cfg.compositor()?;
+    compositor
+        .connect()
+        .with_context(|| t!("compositor.unreachable", name = compositor.label()).to_string())
 }
 
 // ------------------------------------------------------------------ reading --
 
 fn cmd_list(json: bool) -> Result<()> {
-    let monitors = backend()?.monitors()?;
+    let monitors = session()?.outputs()?;
     if json {
         println!("{}", serde_json::to_string_pretty(&monitors)?);
         return Ok(());
@@ -190,6 +205,9 @@ fn cmd_list(json: bool) -> Result<()> {
             t!("cli.table.identifier").to_string(),
         ]);
 
+    // Marked in the table rather than printed on its own line: what you want to
+    // know is which of these screens is the main one, not that one exists.
+    let primary = primary_of(&monitors);
     for m in &monitors {
         let state = if m.disabled {
             t!("cli.state.disabled").to_string()
@@ -201,8 +219,13 @@ fn cmd_list(json: bool) -> Result<()> {
             t!("cli.state.active").to_string()
         };
         let dash = |s: String| if m.disabled { "—".to_string() } else { s };
+        let name = if primary.as_deref() == Some(m.name.as_str()) {
+            format!("{} ★", m.name)
+        } else {
+            m.name.clone()
+        };
         table.add_row(vec![
-            Cell::new(&m.name),
+            Cell::new(name),
             Cell::new(state),
             Cell::new(dash(m.mode().to_string())),
             Cell::new(dash(format!("{}x{}", m.x, m.y))),
@@ -212,8 +235,12 @@ fn cmd_list(json: bool) -> Result<()> {
         ]);
     }
     println!("{table}");
+    // A star nobody explained is just a star.
+    if primary.is_some() {
+        println!("{}", t!("cli.primary.legend"));
+    }
 
-    print_issues(&Layout::from_monitors(&monitors));
+    print_issues(&Layout::from_monitors(&monitors).with_primary(primary));
     Ok(())
 }
 
@@ -231,7 +258,7 @@ fn severity_label(severity: Severity) -> String {
 }
 
 fn cmd_modes(output: &str) -> Result<()> {
-    let monitors = backend()?.monitors()?;
+    let monitors = session()?.outputs()?;
     let m = find(&monitors, output)?;
     if m.available_modes.is_empty() {
         println!("{}", t!("cli.no_modes", name = output));
@@ -266,12 +293,15 @@ fn find<'a>(monitors: &'a [Monitor], name: &str) -> Result<&'a Monitor> {
 // -------------------------------------------------------------- modification --
 
 fn cmd_set(args: SetArgs) -> Result<()> {
-    let hypr = backend()?;
-    let monitors = hypr.monitors()?;
+    let live = session()?;
+    let monitors = live.outputs()?;
     let target = find(&monitors, &args.output)?;
     let preferred = target.preferred_mode();
 
-    let mut layout = Layout::from_monitors(&monitors);
+    // The main screen comes along but the layout is not re-anchored: `set`
+    // changes one field of one output, and silently shifting every other screen
+    // would be a surprise.
+    let mut layout = Layout::from_monitors(&monitors).with_primary(primary_of(&monitors));
     {
         let o = layout
             .get_mut(&args.output)
@@ -326,7 +356,7 @@ fn cmd_set(args: SetArgs) -> Result<()> {
         }
     }
 
-    apply_interactively(&hypr, &layout, args.safety, None)?;
+    apply_interactively(live.as_ref(), &layout, args.safety, None)?;
 
     if let Some(name) = &args.save {
         save_profile(name, false, &layout, &monitors)?;
@@ -339,8 +369,9 @@ fn cmd_arrange(spec: &[String], safety: SafetyArgs) -> Result<()> {
     if !spec.len().is_multiple_of(3) {
         bail!(t!("cli.arrange_expects_triples", count = spec.len()).to_string());
     }
-    let hypr = backend()?;
-    let mut layout = Layout::from_monitors(&hypr.monitors()?);
+    let live = session()?;
+    let monitors = live.outputs()?;
+    let mut layout = Layout::from_monitors(&monitors).with_primary(primary_of(&monitors));
 
     for triple in spec.chunks(3) {
         let relation: Relation = triple[1].parse()?;
@@ -348,26 +379,155 @@ fn cmd_arrange(spec: &[String], safety: SafetyArgs) -> Result<()> {
     }
     layout.normalize();
 
-    apply_interactively(&hypr, &layout, safety, None)
+    apply_interactively(live.as_ref(), &layout, safety, None)
 }
 
 fn cmd_auto(safety: SafetyArgs) -> Result<()> {
-    let hypr = backend()?;
-    let mut layout = Layout::from_monitors(&hypr.monitors()?);
+    let live = session()?;
+    let monitors = live.outputs()?;
+    let mut layout = Layout::from_monitors(&monitors).with_primary(primary_of(&monitors));
     layout.auto_arrange();
-    apply_interactively(&hypr, &layout, safety, None)
+    apply_interactively(live.as_ref(), &layout, safety, None)
+}
+
+/// The connector the configured main screen resolves to, if any.
+///
+/// Every command that builds a layout goes through this, so the anchor and the
+/// focus follow the user's choice whether the layout came from a profile, from
+/// `arrange`, or from a single `set`.
+///
+/// A configuration we cannot read means no main screen rather than a failure:
+/// the real parse error is reported by whatever else needs the file.
+fn primary_of(monitors: &[Monitor]) -> Option<String> {
+    Config::load().ok()?.primary_output(monitors)
+}
+
+/// Lists the compositor plugins, marking the one in force.
+///
+/// Live-apply support is spelled out per plugin: it is the difference between
+/// "hyprdmc drives your session" and "hyprdmc writes your configuration file",
+/// and nothing else on screen would tell you which one you get.
+fn cmd_compositor() -> Result<()> {
+    let cfg = Config::load()?;
+    let active = cfg.compositor()?;
+    println!("{}", describe_compositor(&cfg, active));
+    println!();
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            t!("cli.table.compositor").to_string(),
+            t!("cli.table.active").to_string(),
+            t!("cli.table.detected").to_string(),
+            t!("cli.table.live_apply").to_string(),
+            t!("cli.table.generated").to_string(),
+        ]);
+
+    let mark = |yes: bool| {
+        if yes {
+            t!("cli.yes").to_string()
+        } else {
+            t!("cli.no").to_string()
+        }
+    };
+    for plugin in compositor::all() {
+        table.add_row(vec![
+            Cell::new(plugin.label()),
+            Cell::new(if plugin.id() == active.id() {
+                t!("cli.active_marker").to_string()
+            } else {
+                String::new()
+            }),
+            Cell::new(mark(plugin.running())),
+            Cell::new(mark(plugin.drives_sessions())),
+            Cell::new(format!(
+                "{}, {}",
+                plugin.monitors_file(),
+                plugin.input_file()
+            )),
+        ]);
+    }
+    println!("{table}");
+    println!("{}", t!("cli.compositor.hint"));
+    Ok(())
+}
+
+/// Shows or changes the main screen.
+fn cmd_primary(output: Option<&str>, none: bool, safety: SafetyArgs) -> Result<()> {
+    let live = session()?;
+    let monitors = live.outputs()?;
+    let mut cfg = Config::load()?;
+
+    if none {
+        cfg.settings.primary = None;
+        cfg.save()?;
+        println!("{}", t!("cli.primary.cleared"));
+        return Ok(());
+    }
+
+    let Some(wanted) = output else {
+        match (&cfg.settings.primary, cfg.primary_output(&monitors)) {
+            (Some(pattern), Some(name)) => {
+                println!(
+                    "{}",
+                    t!("cli.primary.current", name = name, pattern = pattern)
+                );
+            }
+            // Set, but the screen it names is not plugged in right now.
+            (Some(pattern), None) => {
+                println!("{}", t!("cli.primary.absent", pattern = pattern));
+            }
+            _ => println!("{}", t!("cli.primary.none")),
+        }
+        return Ok(());
+    };
+
+    let target = monitors
+        .iter()
+        .find(|m| hyprdmc::config::matches_pattern(wanted, m))
+        .ok_or_else(|| {
+            let known = monitors
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow!(t!("cli.primary.unknown", name = wanted, known = known).to_string())
+        })?;
+
+    // Recorded by fingerprint, like a profile rule: the choice is about a screen,
+    // not about the port it happens to be plugged into today.
+    cfg.settings.primary = Some(target.fingerprint());
+    cfg.save()?;
+    println!(
+        "{}",
+        t!(
+            "cli.primary.set",
+            name = target.name,
+            pattern = target.fingerprint()
+        )
+    );
+
+    // Applied straight away: the point of naming a main screen is that the
+    // workspace gets rebuilt around it, and printing "noted" while nothing moves
+    // would leave the user wondering what the setting did.
+    let mut layout = Layout::from_monitors(&monitors).with_primary(Some(target.name.clone()));
+    layout.normalize();
+    apply_interactively(live.as_ref(), &layout, safety, None)
 }
 
 /// Applies a layout then, in a terminal, offers to revert — this is what
 /// avoids being stuck in front of a black screen.
 fn apply_interactively(
-    hypr: &HyprSocket,
+    live: &dyn Session,
     layout: &Layout,
     safety: SafetyArgs,
     profile: Option<&str>,
 ) -> Result<()> {
-    let previous = apply::snapshot(hypr)?;
-    let report = apply::apply(hypr, layout, safety.force)?;
+    let compositor = Config::load()?.compositor()?;
+    let previous = apply::snapshot(live)?;
+    let report = apply::apply(live, compositor, layout, safety.force)?;
     print_report(&report);
 
     if report.rolled_back {
@@ -378,7 +538,7 @@ fn apply_interactively(
     // applied with --no-confirm is still one the user may want to undo.
     if !safety.no_confirm {
         let timeout = Duration::from_secs(Config::load()?.settings.confirm_timeout_secs);
-        if !apply::confirm_or_revert(hypr, &previous, timeout)? {
+        if !apply::confirm_or_revert(live, compositor, &previous, timeout)? {
             println!("{}", t!("apply.reverted"));
             return Ok(());
         }
@@ -386,7 +546,7 @@ fn apply_interactively(
 
     // Only file a layout that survived: the history is an undo list, and an
     // entry the user already rejected has no business in it.
-    remember(hypr, layout, profile);
+    remember(live, layout, profile);
     Ok(())
 }
 
@@ -394,8 +554,8 @@ fn apply_interactively(
 ///
 /// Best-effort: failing to record must not turn a successful apply into an
 /// error, so problems are logged and swallowed.
-fn remember(hypr: &HyprSocket, layout: &Layout, profile: Option<&str>) {
-    let Ok(monitors) = hypr.monitors() else {
+fn remember(live: &dyn Session, layout: &Layout, profile: Option<&str>) {
+    let Ok(monitors) = live.outputs() else {
         return;
     };
     let mut store = Store::load();
@@ -421,8 +581,13 @@ fn cmd_history(action: Option<HistoryAction>) -> Result<()> {
                 .entry(index)
                 .ok_or_else(|| anyhow!(t!("history.unknown_entry", index = index).to_string()))?;
             let when = snapshot.age_label();
-            let hypr = backend()?;
-            apply_interactively(&hypr, &snapshot.layout, safety, snapshot.profile.as_deref())?;
+            let live = session()?;
+            apply_interactively(
+                live.as_ref(),
+                &snapshot.layout,
+                safety,
+                snapshot.profile.as_deref(),
+            )?;
             println!("{}", t!("history.restored", index = index, when = when));
             Ok(())
         }
@@ -507,7 +672,7 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
         }
 
         ProfileAction::Save { name, exact } => {
-            let monitors = backend()?.monitors()?;
+            let monitors = session()?.outputs()?;
             save_profile(&name, exact, &Layout::from_monitors(&monitors), &monitors)?;
             let path = config_path().display().to_string();
             println!("{}", t!("cli.profile_saved_in", name = name, path = path));
@@ -515,14 +680,17 @@ fn cmd_profile(action: ProfileAction) -> Result<()> {
         }
 
         ProfileAction::Apply { name, safety } => {
-            let hypr = backend()?;
-            let monitors = hypr.monitors()?;
+            let live = session()?;
+            let monitors = live.outputs()?;
             let cfg = Config::load()?;
             let profile = cfg
                 .profile(&name)
                 .ok_or_else(|| anyhow!(t!("config.unknown_profile", name = name).to_string()))?;
-            let layout = profile.resolve(&monitors)?;
-            apply_interactively(&hypr, &layout, safety, Some(&name))
+            let mut layout = profile
+                .resolve(&monitors)?
+                .with_primary(cfg.primary_output(&monitors));
+            layout.normalize();
+            apply_interactively(live.as_ref(), &layout, safety, Some(&name))
         }
 
         ProfileAction::Delete { name } => {
@@ -560,7 +728,7 @@ fn cmd_profile_list() -> Result<()> {
     }
 
     // The list must stay readable even without Hyprland running.
-    let monitors = backend().and_then(|b| b.monitors()).unwrap_or_default();
+    let monitors = session().and_then(|s| s.outputs()).unwrap_or_default();
     let active = cfg.best_match(&monitors).map(|p| p.name.clone());
 
     let mut table = Table::new();
@@ -619,66 +787,95 @@ fn save_profile(name: &str, exact: bool, layout: &Layout, monitors: &[Monitor]) 
 }
 
 fn cmd_apply_for_hardware(safety: SafetyArgs) -> Result<()> {
-    let hypr = backend()?;
-    let monitors = hypr.monitors()?;
+    let live = session()?;
+    let monitors = live.outputs()?;
     let cfg = Config::load()?;
 
     let mut chosen: Option<String> = None;
-    let layout = match cfg.best_match(&monitors) {
+    let primary = cfg.primary_output(&monitors);
+    let mut layout = match cfg.best_match(&monitors) {
         Some(profile) => {
             println!("{}", t!("cli.matching_profile", name = &profile.name));
             chosen = Some(profile.name.clone());
-            profile.resolve(&monitors)?
+            profile.resolve(&monitors)?.with_primary(primary)
         }
         None => {
             println!("{}", t!("cli.no_matching_profile"));
-            let mut layout = Layout::from_monitors(&monitors);
+            let mut layout = Layout::from_monitors(&monitors).with_primary(primary);
             layout.auto_arrange();
             layout
         }
     };
-    apply_interactively(&hypr, &layout, safety, chosen.as_deref())
+    // A profile positions its outputs relative to one another; anchoring the set
+    // on the main screen is what turns that into absolute coordinates.
+    layout.normalize();
+    apply_interactively(live.as_ref(), &layout, safety, chosen.as_deref())
 }
 
 // ----------------------------------------------------------------- persistence --
 
 fn cmd_persist() -> Result<()> {
-    let monitors = backend()?.monitors()?;
+    let monitors = session()?.outputs()?;
     let cfg = Config::load()?;
+    let compositor = cfg.compositor()?;
+    println!("{}", describe_compositor(&cfg, compositor));
     emit::persist(
-        &Layout::from_monitors(&monitors),
+        compositor,
+        &Layout::from_monitors(&monitors).with_primary(cfg.primary_output(&monitors)),
         &cfg.settings.monitors_lua,
     )?;
     let path = cfg.settings.monitors_lua.display().to_string();
     println!("{}", t!("cli.persisted", path = path));
 
-    if !requires_generated_file(&hyprland_lua(), &cfg.settings.monitors_lua) {
-        let path = hyprland_lua().display().to_string();
+    if !requires_generated_file(
+        compositor,
+        &compositor.main_config(),
+        &cfg.settings.monitors_lua,
+    ) {
+        let path = compositor.main_config().display().to_string();
         println!("{}", t!("cli.not_required", path = path));
     }
     Ok(())
 }
 
-/// Is `hyprland.lua` already pulling in the file we generate?
-fn requires_generated_file(hypr_conf: &std::path::Path, monitors_lua: &std::path::Path) -> bool {
-    let module = monitors_lua
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("monitors");
-    std::fs::read_to_string(hypr_conf).is_ok_and(|c| {
+/// Is the compositor's own configuration already pulling in the file we generate?
+fn requires_generated_file(
+    compositor: &dyn Compositor,
+    main: &std::path::Path,
+    generated: &std::path::Path,
+) -> bool {
+    std::fs::read_to_string(main).is_ok_and(|c| {
         c.lines().any(|l| {
-            let l = l.trim();
-            !l.starts_with("--")
-                && (l.contains("require(") || l.contains("dofile("))
-                && l.contains(module)
+            !l.trim().starts_with(compositor.comment()) && compositor.includes(l, generated)
         })
     })
 }
 
+/// Names the plugin in force and where the choice came from.
+///
+/// Worth a line of output: which file gets written, and in which syntax, is the
+/// one thing about `persist` and `init` a user cannot guess.
+fn describe_compositor(cfg: &Config, compositor: &dyn Compositor) -> String {
+    let origin = if cfg.settings.compositor.is_some() {
+        t!("compositor.origin.configured")
+    } else {
+        t!("compositor.origin.detected")
+    };
+    t!(
+        "compositor.detected",
+        name = compositor.label(),
+        origin = origin
+    )
+    .to_string()
+}
+
 fn cmd_init(dry_run: bool) -> Result<()> {
     let cfg = Config::load()?;
-    let hypr_conf = hyprland_lua();
+    let compositor = cfg.compositor()?;
+    println!("{}", describe_compositor(&cfg, compositor));
+    let hypr_conf = compositor.main_config();
     let report = emit::run_init_all(
+        compositor,
         &hypr_conf,
         &[&cfg.settings.monitors_lua, &cfg.settings.input_lua],
         dry_run,
@@ -709,7 +906,7 @@ fn cmd_init(dry_run: bool) -> Result<()> {
         "{}",
         t!(
             "cli.init.source_added",
-            statement = emit::require_statement(&hypr_conf, &cfg.settings.monitors_lua)
+            statement = compositor.include(&hypr_conf, &cfg.settings.monitors_lua)
         )
     );
     if !report.adopted.is_empty() {
@@ -718,19 +915,17 @@ fn cmd_init(dry_run: bool) -> Result<()> {
 
     // The current state is written right away: on the next reload, the
     // display and the keyboard must stay exactly as they are now.
-    let hypr = backend()?;
-    let monitors = hypr.monitors()?;
+    let live = session()?;
+    let monitors = live.outputs()?;
     emit::persist(
-        &Layout::from_monitors(&monitors),
+        compositor,
+        &Layout::from_monitors(&monitors).with_primary(cfg.primary_output(&monitors)),
         &cfg.settings.monitors_lua,
     )?;
     let path = cfg.settings.monitors_lua.display().to_string();
     println!("{}", t!("cli.persisted", path = path));
 
-    emit::persist_input(
-        &hyprdmc::input::InputConfig::read(&hypr)?,
-        &cfg.settings.input_lua,
-    )?;
+    emit::persist_input(compositor, &live.read_input()?, &cfg.settings.input_lua)?;
     let input_path = cfg.settings.input_lua.display().to_string();
     println!("{}", t!("cli.persisted", path = input_path));
     println!("{}", t!("cli.init.reload_hint"));
@@ -786,7 +981,7 @@ fn offer_browser(url: &str) {
 }
 
 async fn cmd_daemon(args: WebArgs, with_web: bool) -> Result<()> {
-    let (state, hypr) = daemon::bootstrap()?;
+    let state = daemon::bootstrap()?;
     let addr = web_addr(&*state.config.read().await, &args)?;
 
     if with_web {
@@ -800,11 +995,11 @@ async fn cmd_daemon(args: WebArgs, with_web: bool) -> Result<()> {
     }
 
     tracing::info!("hotplug monitoring active");
-    daemon::run(state, &hypr).await
+    daemon::run(state).await
 }
 
 async fn cmd_web(args: WebArgs) -> Result<()> {
-    let (state, _) = daemon::bootstrap()?;
+    let state = daemon::bootstrap()?;
     let addr = web_addr(&*state.config.read().await, &args)?;
 
     let url = start_web(&state, addr).await?;
